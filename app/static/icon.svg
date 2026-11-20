@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="zeroBgGrad" x1="12%" y1="10%" x2="88%" y2="90%">
+      <stop offset="0%" stop-color="#15191c"/>
+      <stop offset="100%" stop-color="#0a0c0e"/>
+    </linearGradient>
+    <linearGradient id="zeroRingGrad" x1="82%" y1="18%" x2="18%" y2="82%">
+      <stop offset="0%" stop-color="#6ee7b7"/>
+      <stop offset="52%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#047857"/>
+    </linearGradient>
+    <radialGradient id="zeroSparkGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#6ee7b7" stop-opacity="0.58"/>
+      <stop offset="60%" stop-color="#10b981" stop-opacity="0.16"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="zeroCoreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#f3f4f6" stop-opacity="0.28"/>
+      <stop offset="55%" stop-color="#10b981" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#10b981" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="116" fill="url(#zeroBgGrad)" stroke="#263330" stroke-width="4"/>
+  <circle cx="256" cy="256" r="74" fill="url(#zeroCoreGlow)"/>
+  <circle cx="352.17" cy="159.83" r="46" fill="url(#zeroSparkGlow)"/>
+  <path d="M 389.93 232.38 A 136 136 0 1 1 279.62 122.07" fill="none" stroke="url(#zeroRingGrad)" stroke-width="46" stroke-linecap="round"/>
+  <circle cx="352.17" cy="159.83" r="18" fill="#6ee7b7"/>
+  <circle cx="256" cy="256" r="34" fill="#f3f4f6"/>
+</svg>

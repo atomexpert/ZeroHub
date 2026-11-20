@@ -1,0 +1,31 @@
+# Virtual environment
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local data & sessions (stored locally on D:\)
+data/
+users/
+shared_projects/
+scratch/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Environment & secrets
+.env
+.env.local
+
+# Logs & temporary files
+*.log
+tmp/
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
+*.db*
+.env*

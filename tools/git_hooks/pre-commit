@@ -1,0 +1,21 @@
+#!/bin/sh
+# Antigravity Hub pre-commit lock (v146).
+# Runs `tools/verify_hub.py --staged-guard`: blocks live data/secrets in the index,
+# static JS/CSS changes without a CACHE_NAME bump, and any red GOLDEN regression test.
+# Install: git config core.hooksPath tools/git_hooks   (or: python tools/verify_hub.py --install-hooks)
+# Bypassing with `git commit --no-verify` is forbidden by .agents/rules/engineering_guardrails.md.
+
+ROOT=$(git rev-parse --show-toplevel) || exit 1
+cd "$ROOT" || exit 1
+
+if [ -f ".venv/Scripts/python.exe" ]; then
+  PY=".venv/Scripts/python.exe"
+elif [ -x ".venv/bin/python" ]; then
+  PY=".venv/bin/python"
+else
+  echo "pre-commit: .venv interpreter not found; create .venv or run tools/verify_hub.py --staged-guard" >&2
+  exit 1
+fi
+
+echo "pre-commit: running tools/verify_hub.py --staged-guard"
+exec "$PY" tools/verify_hub.py --staged-guard

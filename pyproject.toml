@@ -1,0 +1,13 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    "users",
+    "shared_projects",
+    "data",
+    ".venv",
+    "venv",
+    "node_modules",
+    ".git",
+    "scratch",
+    "tmp",
+]

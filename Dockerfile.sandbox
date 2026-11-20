@@ -1,0 +1,37 @@
+# Antigravity Hub — Isolated Multi-User Dev Sandbox (Node.js + Rust + Python + Git)
+# Build command:
+#   docker build -t agy-hub-sandbox:latest -f Dockerfile.sandbox .
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    CUDA_VISIBLE_DEVICES="" \
+    NVIDIA_VISIBLE_DEVICES=none \
+    NPM_CONFIG_CACHE=/home/dev/.cache/npm \
+    PNPM_STORE_DIR=/home/dev/.local/share/pnpm/store \
+    PIP_CACHE_DIR=/home/dev/.cache/pip \
+    PATH="/usr/local/cargo/bin:/root/.local/bin:/home/dev/.local/bin:${PATH}"
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl git build-essential pkg-config libssl-dev \
+    python3 python3-pip python3-venv python3-openpyxl python3-requests \
+    python3-bs4 python3-lxml python3-yaml \
+    unzip zip jq sqlite3 ripgrep file procps psmisc iproute2 \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && npm install -g pnpm \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
+    && chmod -R a+rX /usr/local/rustup /usr/local/cargo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Free UID 1000 (occupied by built-in 'ubuntu' user in ubuntu:24.04) and create isolated 'dev' user + Linux multi-UID caches
+RUN (id -u ubuntu >/dev/null 2>&1 && userdel -r ubuntu || true) \
+    && useradd -m -s /bin/bash -u 1000 dev \
+    && mkdir -p /workspace /uploads /home/dev/.cache/npm /home/dev/.cache/pip /home/dev/.local/share/pnpm/store \
+    && chown -R dev:dev /workspace /uploads /home/dev \
+    && chmod -R a+rwX /home/dev /uploads
+
+USER dev
+WORKDIR /workspace
+CMD ["bash"]
