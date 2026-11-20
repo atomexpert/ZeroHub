@@ -1,11 +1,11 @@
-const CACHE_NAME = "agy-hub-v159";
+const CACHE_NAME = "agy-hub-v161";
 const SHELL_ASSETS = [
   "/",
   "/manifest.json",
-  "/static/styles.css?v=159",
-  "/static/ui-system.css?v=159",
-  "/static/ui-shell.js?v=159",
-  "/static/app.js?v=159",
+  "/static/styles.css?v=161",
+  "/static/ui-system.css?v=161",
+  "/static/ui-shell.js?v=161",
+  "/static/app.js?v=161",
   "/static/icon.svg",
   "/static/icon-192.png",
   "/static/icon-512.png",

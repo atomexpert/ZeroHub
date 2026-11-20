@@ -647,6 +647,7 @@ function measureViewport(width, height) {
         const settingsCard = settingsModal.querySelector(".modal-card");
         settingsCard.style.animation = "none";
         settingsModal.classList.remove("hidden");
+        api.switchSettingsTab("server");
         const gdCard = get("gdriveSettingsCard");
         const gdCardR = rect(gdCard);
         const setCardR = rect(settingsCard);

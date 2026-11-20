@@ -1,4 +1,6 @@
 """Offline API, browser and export contracts for the ZeroHub release center."""
+import re
+
 from fastapi.testclient import TestClient
 
 from app import auth, config, main, release_service
@@ -6,6 +8,7 @@ from test_frontend_contracts import LINKED_IDS, STATIC, ShellParser
 from test_ui_workspace_minimal_v142 import run_workspace_chromium
 
 UPDATE_IDS = set("""
+sidebarVersionBadge settingsModalVerBadge
 sidebarUpdateBannerBtn updatesSettingsCard updatesCurrentVerBadge updatesSettingsStatusPill
 updatesSettingsHint openUpdatesModalBtn quickCheckUpdatesBtn updatesModal
 updModalVerBadge updRepoExternalLink updTabsBar updTabSystemBtn
@@ -33,9 +36,10 @@ def test_update_assets_and_export():
     assert css.count("!important") == 1  # Existing shared hidden utility.
     assert "!important" not in css.split("  .updates-settings-card {", 1)[1].split("  #agyConfirmModal", 1)[0]
     worker = (STATIC / "sw.js").read_text(encoding="utf-8")
-    assert 'CACHE_NAME = "agy-hub-v159"' in worker
+    cache = re.search(r'CACHE_NAME = "agy-hub-v(\d+)"', worker)
+    assert cache and int(cache[1]) >= 159
     for asset in ("styles.css", "ui-system.css", "ui-shell.js", "app.js"):
-        assert f"{asset}?v=159" in html and f"{asset}?v=159" in worker
+        assert f"{asset}?v={cache[1]}" in html and f"{asset}?v={cache[1]}" in worker
     files, _ = release_service._collect_export(config.BASE_DIR, "1.0.0")
     release_service.scan_export_tree_for_leaks(files)
 
@@ -92,6 +96,43 @@ async function exercise(width, height) {
     const get = id => d.getElementById(id);
     const visible = id => !get(id).classList.contains("hidden");
     const flush = () => new Promise(resolve => setTimeout(resolve, 40));
+    const versionBadge = get("sidebarVersionBadge");
+    const sidebar = get("sidebar");
+    const brand = sidebar.querySelector(".sidebar-brand");
+    const brandTitle = brand.querySelector(".brand-title");
+    const roleBadge = get("sidebarRoleBadge");
+    const closeSidebar = get("closeSidebarBtn");
+    const themes = ["light", "dark"];
+    const versionIds = ["sidebarVersionBadge", "settingsModalVerBadge", "updatesCurrentVerBadge",
+      "updModalVerBadge", "updCurrentVerText"];
+    const labelsMatch = label => versionIds.every(id => get(id).textContent === label);
+    const cacheKey = "agy_hub_cached_app_ver";
+    sidebar.style.transition = "none";
+    function sidebarGeometry(label, update) {
+      sidebar.classList.add("mobile-open");
+      for (const theme of themes) {
+        d.documentElement.dataset.theme = theme;
+        const bounds = brand.getBoundingClientRect();
+        check(bounds.height === 48, "sidebar brand height changed");
+        check(versionBadge.textContent === label, "sidebar version differs");
+        check(versionBadge.classList.contains("has-update") === update, "sidebar update state differs");
+        if (update) {
+          const dot = w.getComputedStyle(versionBadge, "::before");
+          check(dot.width === "5px" && dot.height === "5px", "update dot is missing");
+        }
+        const items = [brandTitle, versionBadge, roleBadge];
+        if (width <= 860) items.push(closeSidebar);
+        for (const item of items) {
+          const rect = item.getBoundingClientRect();
+          check(rect.width > 0 && rect.height > 0 && rect.left >= bounds.left && rect.right <= bounds.right &&
+            rect.top >= bounds.top && rect.bottom <= bounds.bottom,
+          "sidebar brand item escaped " + item.id + " at " + width + " " + JSON.stringify({ rect, bounds }));
+        }
+        check(brandTitle.scrollWidth <= brandTitle.clientWidth + 1, "brand name was truncated");
+        check(brand.scrollWidth <= brand.clientWidth && sidebar.scrollWidth <= sidebar.clientWidth &&
+          d.documentElement.scrollWidth <= width, "sidebar horizontal overflow at " + width + " in " + theme);
+      }
+    }
     const requests = [];
     const token = "ghp_" + "z".repeat(36);
     const publisher = { owner: "atomexpert", repo: "ZeroHub", has_token: true, token_mask: "masked-abcd", draft_notes: "- Draft" };
@@ -100,12 +141,20 @@ async function exercise(width, height) {
       release_title: "Title ".repeat(70), release_notes: "- New feature\n\n" +
       "\x60\x60\x60\n" + "x".repeat(250) + "\n\x60\x60\x60\n\x3cscript>alert(1)\x3c/script>" };
     const status = { current_version: "1.0.0", repo_slug: first.repo_slug, latest: first, active_generations: 2, publisher };
+    let versionAtPublishRefresh;
     w.fetch = async (url, options) => {
       const data = options?.body && JSON.parse(options.body);
       requests.push([url, data]);
       let response, code = 200;
       if (url === "/api/updates/status") response = status;
-      else if (url === "/api/updates/check") { status.latest = next; response = next; }
+      else if (url === "/api/updates/check") {
+        if (status.current_version !== "1.0.0") {
+          versionAtPublishRefresh = labelsMatch("v" + status.current_version);
+        } else {
+          status.latest = next;
+        }
+        response = status.latest;
+      }
       else if (url === "/api/updates/publisher-config") {
         check(data.new_token === token, "new token not sent");
         publisher.token_mask = "masked-zzzz";
@@ -114,6 +163,8 @@ async function exercise(width, height) {
         code = 409;
         response = { detail: "The requested version is unavailable." };
       } else if (url === "/api/updates/publish") {
+        status.current_version = data.version;
+        status.latest = { ...status.latest, current_version: data.version, latest_version: data.version, update_available: false };
         response = { version: data.version, tag_name: "v" + data.version,
           html_url: "https://github.com/atomexpert/ZeroHub/releases/tag/v" + data.version };
       } else throw new Error("Unexpected fetch " + url);
@@ -121,9 +172,24 @@ async function exercise(width, height) {
     };
     api.state.token = "fixture";
     api.state.currentUser = { role: "admin" };
+    api.syncAppVersionBadges(" v2.3.4 ");
+    api.syncAppVersionBadges("invalid");
+    check(labelsMatch("v2.3.4") && w.localStorage.getItem(cacheKey) === "2.3.4", "version normalization or cache failed");
     api.setupMarkdown();
     api.bindUpdatesEvents();
     await api.loadUpdatesStatus();
+    check(labelsMatch("v1.0.0"), "initial installed version differs across badges");
+    sidebarGeometry("v1.0.0", false);
+    const settings = get("settingsModal");
+    settings.classList.remove("hidden");
+    settings.querySelector(".modal-card").style.animation = "none";
+    for (const theme of themes) {
+      d.documentElement.dataset.theme = theme;
+      const badge = get("settingsModalVerBadge").getBoundingClientRect();
+      const header = settings.querySelector(".modal-header").getBoundingClientRect();
+      check(badge.width > 0 && badge.left >= header.left && badge.right <= header.right,
+        "settings version is outside the header");
+    }
     check(!visible("sidebarUpdateBannerBtn"), "pre-release sidebar indicator is visible");
     check(get("pubVersionInput").value === "1.0.0", "first release version");
     get("openUpdatesModalBtn").click();
@@ -134,6 +200,13 @@ async function exercise(width, height) {
     await flush();
     check(requests.filter(([url]) => url === "/api/updates/check").length === 1, "duplicate check ran");
     check(visible("sidebarUpdateBannerBtn") && visible("updApplyBtn"), "update actions missing");
+    sidebarGeometry("v1.0.0", true);
+    check(versionBadge.title.includes("v1.0.0") && versionBadge.title.includes("v1.0.1"), "update tooltip differs");
+    get("updatesModal").classList.add("hidden");
+    versionBadge.click();
+    check(visible("updatesModal"), "sidebar version did not open the release center");
+    if (width <= 860) check(!sidebar.classList.contains("mobile-open"), "mobile sidebar stayed open");
+    await flush();
     check(get("pubVersionInput").value === "1.0.2", "published latest patch suggestion is wrong");
     const notes = get("updReleaseNotes");
     check(notes.querySelectorAll("li").length === 1 && notes.querySelector("pre"), "release notes lost formatting");
@@ -147,7 +220,7 @@ async function exercise(width, height) {
       const body = card.querySelector(".modal-body");
       check(body.scrollWidth <= body.clientWidth + 1, "modal body horizontal overflow");
     }
-    for (const theme of ["light", "dark"]) { d.documentElement.dataset.theme = theme; geometry(); }
+    for (const theme of themes) { d.documentElement.dataset.theme = theme; geometry(); }
 
     get("updApplyBtn").click();
     await flush();
@@ -164,7 +237,7 @@ async function exercise(width, height) {
 
     get("updTabPublishBtn").click();
     check(visible("updPanePublish") && !visible("updPaneSystem"), "publisher tab did not switch");
-    for (const theme of ["light", "dark"]) { d.documentElement.dataset.theme = theme; geometry(); }
+    for (const theme of themes) { d.documentElement.dataset.theme = theme; geometry(); }
     get("pubTokenInput").value = token;
     get("pubToggleTokenBtn").click();
     check(get("pubTokenInput").type === "text", "token reveal did not work");
@@ -184,6 +257,21 @@ async function exercise(width, height) {
     await flush();
     check(get("pubResultBanner").querySelector("a")?.origin === "https://github.com", "release link missing");
     check(requests.find(([url]) => url === "/api/updates/publish")?.[1]?.release_notes === "Manual", "publish payload differs");
+    check(status.current_version === "1.0.2" && versionAtPublishRefresh && labelsMatch("v1.0.2") &&
+      w.localStorage.getItem(cacheKey) === "1.0.2", "published version was not shown and cached immediately");
+    check(!versionBadge.title.includes("v1.0.1"), "published tooltip still advertises an older release");
+
+    api.state.currentUser = { role: "developer" };
+    roleBadge.textContent = "Пользователь с длинным именем";
+    get("wsDot").classList.replace("online", "offline");
+    get("wsStatusText").textContent = "Переподключение…";
+    sidebarGeometry("v1.0.2", false);
+    get("updatesModal").classList.add("hidden");
+    versionBadge.click();
+    await flush();
+    check(visible("updatesModal") && !visible("updTabPublishBtn") && !visible("updPanePublish") &&
+      !visible("updApplyBtn") && !visible("updCheckBtn"), "developer release center exposes admin controls");
+    check(labelsMatch("v1.0.2") && visible("updReleaseDetails"), "developer release information is missing");
 
     if (width === 1440) {
       let healthCalls = 0;
@@ -194,10 +282,6 @@ async function exercise(width, height) {
       };
       await api.waitForUpdatedServer("1.0.1", "old-process");
       check(healthCalls === 2, "restart poll accepted the old process");
-    } else {
-      api.state.currentUser = { role: "developer" };
-      await api.loadUpdatesStatus();
-      check(!visible("updTabPublishBtn") && !visible("updPanePublish") && !visible("updApplyBtn"), "developer can see admin controls");
     }
     return [width, height];
   } finally {

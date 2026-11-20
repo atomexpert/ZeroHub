@@ -130,6 +130,7 @@
   const initialVoicePrefs = migrateAndLoadVoicePrefs();
 
   const state = {
+    settingsActiveTab: localStorage.getItem("agy_hub_settings_tab") || "appearance",
     themeMode:
       localStorage.getItem("agy_hub_theme_mode") ||
       localStorage.getItem("agy_hub_theme") ||
@@ -720,6 +721,7 @@
     sidebar: $("sidebar"),
     sidebarResizer: $("sidebarResizer"),
     sidebarRoleBadge: $("sidebarRoleBadge"),
+    sidebarVersionBadge: $("sidebarVersionBadge"),
     sidebarBackdrop: $("sidebarBackdrop"),
     toggleSidebarBtn: $("toggleSidebarBtn"),
     sidebarToggleRadar: $("sidebarToggleRadar"),
@@ -1040,6 +1042,25 @@
     copyQrUrlBtn: $("copyQrUrlBtn"),
 
     settingsModal: $("settingsModal"),
+    settingsModalVerBadge: $("settingsModalVerBadge"),
+    settingsTabsBar: $("settingsTabsBar"),
+    settingsTabAppearanceBtn: $("settingsTabAppearanceBtn"),
+    settingsTabAiBtn: $("settingsTabAiBtn"),
+    settingsTabServerBtn: $("settingsTabServerBtn"),
+    settingsTabAccountBtn: $("settingsTabAccountBtn"),
+    settingsPaneAppearance: $("settingsPaneAppearance"),
+    settingsPaneAi: $("settingsPaneAi"),
+    settingsPaneServer: $("settingsPaneServer"),
+    settingsPaneAccount: $("settingsPaneAccount"),
+    settingsProvidersList: $("settingsProvidersList"),
+    settingsGoogleBlock: $("settingsGoogleBlock"),
+    settingsGoogleStatusBadge: $("settingsGoogleStatusBadge"),
+    settingsGoogleSubHint: $("settingsGoogleSubHint"),
+    settingsProfileCard: $("settingsProfileCard"),
+    settingsProfileIdentity: $("settingsProfileIdentity"),
+    settingsProfileRoleBadge: $("settingsProfileRoleBadge"),
+    settingsProfileSubHint: $("settingsProfileSubHint"),
+    openQrFromSettingsBtn: $("openQrFromSettingsBtn"),
     themeModeGroup: $("themeModeGroup"),
     paletteGrid: $("paletteGrid"),
     userRulesSection: $("userRulesSection"),
@@ -2294,6 +2315,8 @@
 
     if (els.openUsersAdminBtn) els.openUsersAdminBtn.classList.toggle("hidden", !admin);
     if (els.adminSettingsSection) els.adminSettingsSection.classList.toggle("hidden", !admin);
+    switchSettingsTab(state.settingsActiveTab, { persist: false, resetScroll: state.settingsActiveTab === "server" && !admin });
+    renderSettingsProfileCard();
     if (els.gdriveSettingsCard) els.gdriveSettingsCard.classList.toggle("hidden", !admin);
     if (!admin && els.gdriveModal) els.gdriveModal.classList.add("hidden");
     if (els.advisorRecalibrateBtn) els.advisorRecalibrateBtn.classList.toggle("hidden", !admin);
@@ -2692,6 +2715,7 @@
           sys = await apiFetch("/api/system/info");
         }
         state.systemInfo = sys;
+        syncAppVersionBadges(sys.version);
         if (sys.user) {
           state.currentUser = sys.user;
           persistActiveUserHint(sys.user);
@@ -31039,7 +31063,94 @@
     showToast("Память вкладки разгружена");
   }
 
-  async function openSettingsModal() {
+  function switchSettingsTab(tabId, { persist = true, resetScroll = true } = {}) {
+    const admin = isAdminUser();
+    const tabs = [
+      ["appearance", els.settingsTabAppearanceBtn, els.settingsPaneAppearance],
+      ["ai", els.settingsTabAiBtn, els.settingsPaneAi],
+      ["server", els.settingsTabServerBtn, els.settingsPaneServer],
+      ["account", els.settingsTabAccountBtn, els.settingsPaneAccount],
+    ];
+    if (!tabs.some(([key]) => key === tabId) || (tabId === "server" && !admin)) {
+      tabId = "appearance";
+    }
+    state.settingsActiveTab = tabId;
+    els.settingsTabServerBtn?.classList.toggle("hidden", !admin);
+    for (const [key, button, pane] of tabs) {
+      if (!button || !pane) continue;
+      const selected = key === tabId;
+      button.classList.toggle("active", selected);
+      button.setAttribute("aria-selected", String(selected));
+      button.tabIndex = selected ? 0 : -1;
+      pane.classList.toggle("hidden", !selected);
+    }
+    if (resetScroll && els.settingsTabsBar) {
+      const body = els.settingsModal.querySelector(".modal-body");
+      if (body) body.scrollTop = 0;
+    }
+    if (persist) {
+      try { localStorage.setItem("agy_hub_settings_tab", tabId); } catch {}
+    }
+  }
+
+  function renderSettingsProfileCard() {
+    if (!els.settingsProfileCard) return;
+    const user = state.currentUser;
+    if (!user) {
+      els.settingsProfileCard.classList.add("hidden");
+      return;
+    }
+    els.settingsProfileCard.classList.remove("hidden");
+    const handle = user.username ? "@" + user.username : "";
+    const name = user.display_name?.trim();
+    els.settingsProfileIdentity.textContent = name && name !== user.username ?
+      [name, handle].filter(Boolean).join(" · ") : handle || "Профиль";
+    const admin = user.role === "admin";
+    els.settingsProfileRoleBadge.textContent = admin ? "Админ" : "Пользователь";
+    els.settingsProfileRoleBadge.classList.toggle("is-ok", admin);
+    els.settingsProfileRoleBadge.classList.toggle("is-muted", !admin);
+    els.settingsProfileSubHint.textContent = admin ?
+      "Управление сервером и общими проектами" : "Личное рабочее пространство";
+  }
+
+  function bindSettingsTabs() {
+    const bar = els.settingsTabsBar;
+    bar?.addEventListener("click", event => {
+      const tab = event.target.closest("[data-settings-tab]");
+      if (tab && !tab.classList.contains("hidden")) switchSettingsTab(tab.dataset.settingsTab);
+    });
+    bar?.addEventListener("keydown", event => {
+      const tabs = [...bar.querySelectorAll('[role="tab"]:not(.hidden)')];
+      const current = tabs.indexOf(event.target);
+      if (current < 0) return;
+      let next;
+      switch (event.key) {
+        case "Home": next = 0; break;
+        case "End": next = tabs.length - 1; break;
+        case "ArrowLeft": next = (current + tabs.length - 1) % tabs.length; break;
+        case "ArrowRight": next = (current + 1) % tabs.length; break;
+        default: return;
+      }
+      event.preventDefault();
+      switchSettingsTab(tabs[next].dataset.settingsTab);
+      tabs[next].focus();
+    });
+    els.openQrFromSettingsBtn?.addEventListener("click", async () => {
+      els.settingsModal.classList.add("hidden");
+      try {
+        await openQrModal();
+      } catch (error) {
+        if (state.token) els.settingsModal.classList.remove("hidden");
+        showToast(error.message);
+      }
+    });
+    els.openQuotaFromSettingsBtn?.addEventListener("click", () => {
+      els.settingsModal.classList.add("hidden");
+      openQuotaModal();
+    });
+  }
+
+  async function openSettingsModal(initialTab) {
     const [sys, rulesResp] = await Promise.all([
       apiFetch("/api/system/info"),
       apiFetch("/api/account/rules").catch(() => null),
@@ -31099,12 +31210,15 @@
     } else if (els.gdriveSettingsCard) {
       els.gdriveSettingsCard.classList.add("hidden");
     }
+    const tab = typeof initialTab === "string" && initialTab ? initialTab : state.settingsActiveTab;
     els.settingsModal.classList.remove("hidden");
+    switchSettingsTab(tab);
     void loadUpdatesStatus();
   }
 
   // ===================== ZEROHUB RELEASE CENTER =====================
-  const updatesUI = { status: null, action: "", opener: null, suggestedVersion: "" };
+  const updatesUI = { status: null, action: "", opener: null, suggestedVersion: "", version: "1.0.0" };
+  const appVersionStorageKey = "agy_hub_cached_app_ver";
   const releaseVersionPattern = /^(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)$/;
   const githubSlugPattern = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
@@ -31168,19 +31282,36 @@
     $("updatesModal").querySelector(".upd-modal-body").scrollTop = 0;
   }
 
+  function syncAppVersionBadges(rawVersion) {
+    if (typeof rawVersion !== "string") return;
+    const version = rawVersion.trim().replace(/^v/i, "");
+    if (!releaseVersionPattern.test(version)) return;
+    updatesUI.version = version;
+    try {
+      localStorage.setItem(appVersionStorageKey, version);
+    } catch {}
+    const label = "v" + version;
+    for (const node of [els.sidebarVersionBadge, els.settingsModalVerBadge,
+      $("updatesCurrentVerBadge"), $("updModalVerBadge"), $("updCurrentVerText")]) {
+      if (node && node.textContent !== label) node.textContent = label;
+    }
+  }
+
   function renderUpdatesStatus(previous = null) {
     if (!$("updatesModal")) return;
     const status = updatesUI.status;
     const admin = canManageUpdates();
     const publisher = admin && status?.publisher;
-    const current = status?.current_version || state.systemInfo?.version || "1.0.0";
+    syncAppVersionBadges(status?.current_version);
+    const current = updatesUI.version;
     const latest = status?.latest;
     const available = latest?.update_available === true;
     const published = latest?.published_yet === true;
     $("updatesSettingsCard").classList.toggle("hidden", !admin);
-    for (const node of [$("updatesCurrentVerBadge"), $("updModalVerBadge"), $("updCurrentVerText")]) {
-      node.textContent = "v" + current;
-    }
+    els.sidebarVersionBadge.classList.toggle("has-update", available);
+    els.sidebarVersionBadge.title = available
+      ? "ZeroHub v" + current + " · Доступно обновление v" + latest.latest_version
+      : "ZeroHub v" + current + " — нажмите, чтобы посмотреть статус версии";
     $("updReleaseInfoBox").classList.toggle("upd-release-available", available);
     const pill = $("updatesSettingsStatusPill");
     pill.textContent = available ? "Доступно v" + latest.latest_version :
@@ -31271,7 +31402,9 @@
     $("pubTokenInput").value = "";
     setPublisherTokenVisible(false);
     if (restoreFocus) {
-      const opener = updatesUI.opener?.getClientRects().length ? updatesUI.opener : $("openSettingsBtn");
+      const opener = updatesUI.opener === els.sidebarVersionBadge && isMobileViewport()
+        ? els.toggleSidebarBtn
+        : updatesUI.opener?.getClientRects().length ? updatesUI.opener : $("openSettingsBtn");
       opener?.focus();
     }
     updatesUI.opener = null;
@@ -31418,6 +31551,7 @@
       if (!result.restarting || !result.previous_boot_id) throw new Error("Сервер не подтвердил перезапуск.");
       progress.textContent = "Ожидаем запуск ZeroHub v" + result.updated_version + "…";
       await waitForUpdatedServer(result.updated_version, result.previous_boot_id);
+      syncAppVersionBadges(result.updated_version);
       progress.textContent = "Новая версия запущена. Обновляем страницу…";
       await refreshUpdatedAssets();
     } catch (error) {
@@ -31525,6 +31659,10 @@
     if (!$("updatesModal")) return;
     $("pubShieldNotice").insertAdjacentHTML("afterbegin", window.AgyUI?.icon("shieldCheck", "ui-ico-xs") || "");
     $("updatesSettingsHint").classList.add("upd-settings-hint");
+    els.sidebarVersionBadge.addEventListener("click", () => {
+      closeMobileSidebar();
+      void openUpdatesModal(els.sidebarVersionBadge);
+    });
     for (const button of [$("openUpdatesModalBtn"), $("sidebarUpdateBannerBtn")]) {
       button.addEventListener("click", () => void openUpdatesModal(button));
     }
@@ -33579,6 +33717,18 @@
     const cldPct = q && q.claude_5h_pct !== null && q.claude_5h_pct !== undefined
       ? Number(q.claude_5h_pct)
       : null;
+
+    if (els.settingsGoogleBlock) {
+      const badge = els.settingsGoogleStatusBadge;
+      badge.textContent = cliOk ? "CLI доступен" : "Требуется вход";
+      badge.classList.toggle("is-ok", cliOk);
+      badge.classList.toggle("is-muted", !cliOk);
+      const gem = Number.isFinite(gemPct) ? Math.round(gemPct) + "%" : "—";
+      const cld = Number.isFinite(cldPct) ? Math.round(cldPct) + "%" : "—";
+      els.settingsGoogleSubHint.textContent = Number.isFinite(gemPct) || Number.isFinite(cldPct) ?
+        "5 ч · Gem " + gem + " · Cld " + cld :
+        cliOk ? "Данные о квотах пока недоступны" : "Подключите аккаунт для просмотра квот";
+    }
 
     if (els.sacGemPct) {
       els.sacGemPct.textContent = gemPct !== null ? `${Math.round(gemPct)}%` : "—";
@@ -47884,6 +48034,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     });
 
     els.openSettingsBtn.addEventListener("click", openSettingsModal);
+    bindSettingsTabs();
     bindGdriveEvents();
     bindUpdatesEvents();
     bindProjectEnvEvents();
@@ -48252,12 +48403,6 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     if (els.mobTelemetryExpandBtn) {
       els.mobTelemetryExpandBtn.addEventListener("click", () => {
         setMobileTelemetryExpanded(!state.mobTelemetryExpanded);
-      });
-    }
-    if (els.openQuotaFromSettingsBtn) {
-      els.openQuotaFromSettingsBtn.addEventListener("click", () => {
-        els.settingsModal.classList.add("hidden");
-        openQuotaModal();
       });
     }
     if (els.refreshQuotasBtn) {
@@ -49283,7 +49428,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
         const adminPinBtn = e.target.closest("[data-admin-open-pin]");
         if (adminPinBtn) {
           els.usersAdminModal.classList.add("hidden");
-          await openSettingsModal();
+          await openSettingsModal("account");
           setTimeout(() => els.oldPinInput && els.oldPinInput.focus(), 80);
           return;
         }
@@ -49539,6 +49684,8 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       tabViewCache.clear();
       state.token = "";
       state.currentUser = null;
+      switchSettingsTab("appearance");
+      renderSettingsProfileCard();
       state.userRules.savedText = "";
       if (els.userRulesTextarea) els.userRulesTextarea.value = "";
       state.openrouter.summary = null;
@@ -51766,6 +51913,9 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
 
   // ===================== INIT =====================
   async function init() {
+    try {
+      syncAppVersionBadges(localStorage.getItem(appVersionStorageKey));
+    } catch {}
     applyAppearance({ mode: state.themeMode, palette: state.palette });
     setupMarkdown();
     bindEvents();
@@ -52026,6 +52176,9 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       createProjectGitCheckpointFromModal,
       rollbackProjectGitFromModal,
       applyRoleUI,
+      switchSettingsTab,
+      bindSettingsTabs,
+      renderSettingsProfileCard,
       openSettingsModal,
       classifyModelVendor,
       parseModelEntry,
@@ -52054,6 +52207,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       syncGdriveRestoreVaultPassUI,
       bindGdriveEvents,
       bindUpdatesEvents,
+      syncAppVersionBadges,
       loadUpdatesStatus,
       waitForUpdatedServer,
       renderChatActiveProcessesBar,

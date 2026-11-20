@@ -613,7 +613,46 @@
     padding: 0 12px;
     border-bottom: var(--ui-border-hairline);
   }
+  .sidebar-brand .brand-title { flex-shrink: 0; }
+  .sidebar-version-badge {
+    font-family: "JetBrains Mono", ui-monospace, monospace;
+    font-size: 10.5px;
+    font-weight: 500;
+    line-height: 1.2;
+    padding: 1px 5px;
+    border-radius: 5px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    flex-shrink: 0;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  .sidebar-version-badge.has-update {
+    border-color: color-mix(in srgb, var(--accent) 35%, transparent);
+    color: var(--accent);
+  }
+  .sidebar-version-badge.has-update::before {
+    content: "";
+    display: inline-block;
+    width: 5px;
+    height: 5px;
+    margin-inline-end: 4px;
+    border-radius: 50%;
+    background: currentColor;
+    vertical-align: middle;
+  }
+  .sidebar-version-badge:is(:hover, :focus-visible) {
+    background: var(--bg-surface-hover);
+    color: var(--text-heading);
+  }
+  @media (max-width: 340px) {
+    .sidebar-brand .brand-titles { gap: 4px; }
+  }
   #sidebarRoleBadge {
+    min-width: 0;
+    flex-shrink: 1;
     padding: 0;
     border: 0;
     background: transparent;
@@ -633,7 +672,16 @@
     box-shadow: none;
     animation: none;
   }
+  #wsStatusText {
+    max-width: 64px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   #wsDot.online + #wsStatusText { display: none; }
+  @media (max-width: 340px) {
+    #wsStatusText { max-width: 44px; }
+  }
 
   #sidebar .sidebar-controls {
     padding: 6px 8px;
@@ -1812,6 +1860,159 @@
   }
 
   /* Universal minimal confirm dialog / sheet (AgyUI.confirm, v=150) */
+  @media (min-width: 769px) {
+    #settingsModal > .settings-modal-card {
+      width: min(100%, 660px);
+      max-width: 660px;
+    }
+  }
+
+  .settings-modal-heading {
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 8px;
+  }
+  .settings-ver-pill {
+    flex-shrink: 0;
+  }
+
+  #settingsModal .modal-body {
+    min-height: 0;
+    min-width: 0;
+  }
+
+  .settings-tabs-bar {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 5px;
+    flex-shrink: 0;
+    padding: 8px 12px;
+    border-bottom: var(--ui-border-hairline);
+    background: var(--bg-surface);
+  }
+
+  .settings-tabs-bar:has(#settingsTabServerBtn.hidden) {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  .settings-tabs-bar > button {
+    min-width: 0;
+    min-height: 36px;
+    padding: 5px 4px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    color: var(--text-secondary);
+    background: var(--bg-surface-elevated);
+    font: inherit;
+    line-height: 1.2;
+    cursor: pointer;
+  }
+
+  .settings-tabs-bar > button:hover {
+    color: var(--text-primary);
+    background: var(--bg-surface-hover);
+  }
+
+  .settings-tabs-bar > button.active {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 40%, var(--border-subtle));
+    background: color-mix(in srgb, var(--accent) 10%, var(--bg-surface-elevated));
+  }
+
+  .settings-tab-pane,
+  #settingsModal #adminSettingsSection {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  .settings-tab-pane > :is(.divider, .settings-storage-card, .settings-or-card),
+  #settingsModal #adminSettingsSection > * {
+    margin-block: 0;
+  }
+
+  #settingsModal #paletteGrid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 6px;
+  }
+
+  #settingsModal .palette-card { padding: 7px 8px; gap: 7px; }
+  #settingsModal .palette-name { white-space: normal; overflow-wrap: anywhere; }
+  #settingsModal .palette-swatch { width: 22px; height: 22px; }
+  #settingsModal .palette-desc { display: none; }
+
+  #settingsProvidersList {
+    min-width: 0;
+    border: var(--ui-border-hairline);
+    border-radius: 12px;
+    background: var(--bg-surface-elevated);
+  }
+
+  #settingsProvidersList > .settings-or-card {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px 12px;
+    margin: 0;
+    border: 0;
+    border-radius: 0;
+    padding: 9px 12px;
+    background: transparent;
+  }
+
+  #settingsProvidersList > .settings-or-card + .settings-or-card {
+    border-top: var(--ui-border-hairline);
+  }
+
+  #settingsProvidersList .settings-or-actions button { width: auto; }
+  #settingsModal .field-row-2 > * { min-width: 0; }
+
+  #settingsModal :is(#gdriveSettingsCard, #updatesSettingsCard) {
+    gap: 7px 12px;
+    padding: 9px 12px;
+  }
+
+  #settingsModal :is(#gdriveSettingsCard, #updatesSettingsCard) .settings-or-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  #settingsModal :is(#gdriveSettingsCard, #updatesSettingsCard) .settings-or-actions > button {
+    flex: 0 1 auto;
+    width: auto;
+    white-space: normal;
+  }
+
+  @media (min-width: 580px) {
+    #settingsModal #paletteGrid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 768px) {
+    #settingsModal > .settings-modal-card { width: 100%; max-width: 100%; }
+    #settingsModal #gdriveSettingsCard .gdrive-settings-info { flex: 0 1 auto; }
+    #settingsModal :is(#gdriveSettingsCard, #updatesSettingsCard) .settings-or-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      width: 100%;
+    }
+    #settingsModal :is(#gdriveSettingsCard, #updatesSettingsCard) .settings-or-actions > button { min-width: 0; }
+  }
+
+  @media (max-width: 560px) {
+    .settings-tabs-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
+  @media (max-width: 460px) {
+    #settingsProvidersList > .settings-or-card { flex-direction: column; align-items: flex-start; }
+  }
+
+  @media (max-width: 379px) {
+    .settings-tabs-bar:has(#settingsTabServerBtn.hidden) { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+
   .updates-settings-card {
     gap: 10px;
     min-width: 0;

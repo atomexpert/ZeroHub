@@ -18,8 +18,9 @@ CRITICAL_IDS = set("""
 """.split())
 
 # Snapshot of the IDs present in both the Hub shell and direct JS lookups.
-MIN_LINKED_IDS = 898
+MIN_LINKED_IDS = 918
 LINKED_IDS = set("""
+    sidebarVersionBadge settingsModalVerBadge
     accEmailInput accLabelInput accProfileIdInput accProxyCustomBox accProxyGlobalHint
     accProxyModeGroup accProxySpecInput accProxyTestBtn accProxyTestResult accessModeSelect
     accountProfileForm accountProfilesList accountStatusPill activeChatArchivedPill
@@ -211,6 +212,11 @@ LINKED_IDS = set("""
     pubTokenInput pubToggleTokenBtn pubSaveConfigBtn pubVersionInput
     pubTitleInput pubNotesTextarea pubFillDraftBtn pubShieldNotice
     pubSubmitReleaseBtn pubResultBanner
+    settingsTabsBar settingsTabAppearanceBtn settingsTabAiBtn settingsTabServerBtn
+    settingsTabAccountBtn settingsPaneAppearance settingsPaneAi settingsPaneServer
+    settingsPaneAccount settingsProvidersList settingsGoogleBlock settingsGoogleStatusBadge
+    settingsGoogleSubHint settingsProfileCard settingsProfileIdentity settingsProfileRoleBadge
+    settingsProfileSubHint openQrFromSettingsBtn
     ctxProjEnvBtn projEnvAddRowBtn projEnvExampleBar projEnvExampleHint projEnvExportExampleBtn
     projEnvFilePills projEnvImportExampleBtn projEnvModeRawBtn projEnvModeTableBtn
     projEnvNewCommentInput projEnvNewKeyInput projEnvNewValInput projEnvRawMaskOverlay

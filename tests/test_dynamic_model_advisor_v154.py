@@ -859,6 +859,7 @@ function measureViewport(width, height) {
         ];
 
         get("settingsModal").classList.remove("hidden");
+        api.switchSettingsTab("ai");
         const details = get("advisorCatalogDetails");
         details.open = true;
         api.renderAdvisorCatalogUI();

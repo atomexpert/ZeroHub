@@ -67,8 +67,8 @@
       if (hl && eff === "light") hl.setAttribute("href", "/static/vendor/github.min.css");
     })();
   </script>
-  <link rel="stylesheet" href="/static/styles.css?v=159" />
-  <link rel="stylesheet" href="/static/ui-system.css?v=159" />
+  <link rel="stylesheet" href="/static/styles.css?v=161" />
+  <link rel="stylesheet" href="/static/ui-system.css?v=161" />
 </head>
 <body>
   <!-- ================= LOGIN OVERLAY (USERNAME + PASSWORD) ================= -->
@@ -127,6 +127,7 @@
           </div>
           <div class="brand-titles">
             <span class="brand-title">ZeroHub</span>
+            <button id="sidebarVersionBadge" type="button" class="sidebar-version-badge" title="Версия ZeroHub — нажмите, чтобы открыть сведения о версии и обновлениях">v1.0.0</button>
             <span id="sidebarRoleBadge" class="sidebar-role-badge">Админ</span>
           </div>
         </div>
@@ -933,359 +934,398 @@
   </div>
 
   <!-- ================= MODAL: SETTINGS & PIN ================= -->
-  <div id="settingsModal" class="modal-backdrop hidden">
-    <div class="modal-card">
+  <div id="settingsModal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Настройки ZeroHub">
+    <div class="modal-card settings-modal-card">
       <div class="modal-header">
-        <h3>Настройки ZeroHub</h3>
-        <button type="button" class="icon-btn" data-close-modal="settingsModal">
+        <div class="settings-modal-heading">
+          <h3>Настройки ZeroHub</h3>
+          <span id="settingsModalVerBadge" class="or-mini-pill settings-ver-pill">v1.0.0</span>
+        </div>
+        <button type="button" class="icon-btn" data-close-modal="settingsModal" aria-label="Закрыть">
           <svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
         </button>
       </div>
+      <div id="settingsTabsBar" class="settings-tabs-bar" role="tablist" aria-label="Разделы настроек">
+        <button id="settingsTabAppearanceBtn" type="button" class="active" role="tab" data-settings-tab="appearance" aria-controls="settingsPaneAppearance" aria-selected="true" tabindex="0">🎨 Вид и голос</button>
+        <button id="settingsTabAiBtn" type="button" role="tab" data-settings-tab="ai" aria-controls="settingsPaneAi" aria-selected="false" tabindex="-1">🧭 ИИ и квоты</button>
+        <button id="settingsTabServerBtn" type="button" class="hidden" role="tab" data-settings-tab="server" aria-controls="settingsPaneServer" aria-selected="false" tabindex="-1">☁️ Сервер</button>
+        <button id="settingsTabAccountBtn" type="button" role="tab" data-settings-tab="account" aria-controls="settingsPaneAccount" aria-selected="false" tabindex="-1">🔐 Аккаунт</button>
+      </div>
       <div class="modal-body">
-        <div class="settings-section-title">Оформление и темы</div>
-        <div id="themeModeGroup" class="theme-mode-switch" role="radiogroup" aria-label="Режим яркости">
-          <button type="button" class="theme-mode-btn" data-theme-mode="dark">
-            <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
-            <span>Тёмная</span>
-          </button>
-          <button type="button" class="theme-mode-btn" data-theme-mode="light">
-            <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
-            <span>Светлая</span>
-          </button>
-          <button type="button" class="theme-mode-btn" data-theme-mode="system">
-            <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
-            <span>Авто</span>
-          </button>
-        </div>
-        <div id="paletteGrid" class="palette-grid" role="radiogroup" aria-label="Цветовая палитра">
-          <button type="button" class="palette-card active" data-palette="emerald">
-            <span class="palette-swatch swatch-emerald" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Хвоя и бумага</span>
-              <span class="palette-desc">Студийный эталон</span>
-            </span>
-          </button>
-          <button type="button" class="palette-card" data-palette="gemini">
-            <span class="palette-swatch swatch-gemini" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Сапфир</span>
-              <span class="palette-desc">Кобальт и камень</span>
-            </span>
-          </button>
-          <button type="button" class="palette-card" data-palette="linear">
-            <span class="palette-swatch swatch-linear" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Графит</span>
-              <span class="palette-desc">Строгий индиго</span>
-            </span>
-          </button>
-          <button type="button" class="palette-card" data-palette="claude">
-            <span class="palette-swatch swatch-claude" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Песок</span>
-              <span class="palette-desc">Крем и терракота</span>
-            </span>
-          </button>
-          <button type="button" class="palette-card" data-palette="nord">
-            <span class="palette-swatch swatch-nord" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Океан</span>
-              <span class="palette-desc">Арктический сланец</span>
-            </span>
-          </button>
-          <button type="button" class="palette-card" data-palette="amethyst">
-            <span class="palette-swatch swatch-amethyst" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Аметист</span>
-              <span class="palette-desc">Приглушённый ирис</span>
-            </span>
-          </button>
-          <button type="button" class="palette-card" data-palette="copper">
-            <span class="palette-swatch swatch-copper" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Титан</span>
-              <span class="palette-desc">Тёплая бронза</span>
-            </span>
-          </button>
-          <button type="button" class="palette-card" data-palette="amoled">
-            <span class="palette-swatch swatch-amoled" aria-hidden="true"></span>
-            <span class="palette-meta">
-              <span class="palette-name">Монохром</span>
-              <span class="palette-desc">Чистый контраст OLED</span>
-            </span>
-          </button>
-        </div>
-        <hr class="divider" />
-        <div class="settings-rules-block" id="userRulesSection">
-          <div class="settings-rules-head">
-            <div class="settings-section-title">Мои правила для ИИ</div>
-            <span id="userRulesCounter" class="rules-char-counter">0 симв. · 0 / 24 КБ</span>
+        <section id="settingsPaneAppearance" class="settings-tab-pane" role="tabpanel" aria-labelledby="settingsTabAppearanceBtn">
+          <div class="settings-section-title">Оформление и темы</div>
+          <div id="themeModeGroup" class="theme-mode-switch" role="radiogroup" aria-label="Режим яркости">
+            <button type="button" class="theme-mode-btn" data-theme-mode="dark">
+              <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/></svg>
+              <span>Тёмная</span>
+            </button>
+            <button type="button" class="theme-mode-btn" data-theme-mode="light">
+              <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32l1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+              <span>Светлая</span>
+            </button>
+            <button type="button" class="theme-mode-btn" data-theme-mode="system">
+              <svg class="ico ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+              <span>Авто</span>
+            </button>
           </div>
-          <div class="settings-hint">
-            Личные инструкции действуют во всех ваших чатах и проектах внутри Hub (например: язык ответов, стиль кода, формат разбора) — изолированно от других пользователей и десктопной программы Antigravity.
+          <div id="paletteGrid" class="palette-grid" role="radiogroup" aria-label="Цветовая палитра">
+            <button type="button" class="palette-card active" data-palette="emerald">
+              <span class="palette-swatch swatch-emerald" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Хвоя и бумага</span>
+                <span class="palette-desc">Студийный эталон</span>
+              </span>
+            </button>
+            <button type="button" class="palette-card" data-palette="gemini">
+              <span class="palette-swatch swatch-gemini" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Сапфир</span>
+                <span class="palette-desc">Кобальт и камень</span>
+              </span>
+            </button>
+            <button type="button" class="palette-card" data-palette="linear">
+              <span class="palette-swatch swatch-linear" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Графит</span>
+                <span class="palette-desc">Строгий индиго</span>
+              </span>
+            </button>
+            <button type="button" class="palette-card" data-palette="claude">
+              <span class="palette-swatch swatch-claude" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Песок</span>
+                <span class="palette-desc">Крем и терракота</span>
+              </span>
+            </button>
+            <button type="button" class="palette-card" data-palette="nord">
+              <span class="palette-swatch swatch-nord" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Океан</span>
+                <span class="palette-desc">Арктический сланец</span>
+              </span>
+            </button>
+            <button type="button" class="palette-card" data-palette="amethyst">
+              <span class="palette-swatch swatch-amethyst" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Аметист</span>
+                <span class="palette-desc">Приглушённый ирис</span>
+              </span>
+            </button>
+            <button type="button" class="palette-card" data-palette="copper">
+              <span class="palette-swatch swatch-copper" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Титан</span>
+                <span class="palette-desc">Тёплая бронза</span>
+              </span>
+            </button>
+            <button type="button" class="palette-card" data-palette="amoled">
+              <span class="palette-swatch swatch-amoled" aria-hidden="true"></span>
+              <span class="palette-meta">
+                <span class="palette-name">Монохром</span>
+                <span class="palette-desc">Чистый контраст OLED</span>
+              </span>
+            </button>
           </div>
-          <textarea
-            id="userRulesTextarea"
-            rows="5"
-            class="field-textarea user-rules-textarea"
-            placeholder="Например: Отвечай кратко и по делу на русском языке. В Python-коде используй строгую типизацию и async/await, без лишней воды…"
-          ></textarea>
-          <div class="settings-rules-actions">
-            <button type="button" id="saveUserRulesBtn" class="btn-primary">Сохранить правила</button>
-            <span id="userRulesStatusHint" class="rules-saved-hint">Чистый изолированный контекст</span>
-          </div>
-        </div>
-
-        <div id="settingsModelAdvisorBlock" class="settings-or-card settings-advisor-card">
-          <div class="settings-advisor-head">
-            <div class="settings-or-title-row">
-              <span class="settings-section-title">🧭 Советник выбора нейросети</span>
-              <span id="advisorStatusBadge" class="or-mini-pill is-ok">Включён</span>
-            </div>
-            <label class="settings-advisor-toggle">
-              <input type="checkbox" id="advisorEnabledChk" checked />
-              <span>Включён</span>
-            </label>
-          </div>
-          <div class="settings-hint">
-            Мгновенно ранжирует доступные вам нейросети под сложность задачи и остаток 5-часовых квот (0 мс задержки, синхронизация между устройствами).
-          </div>
-          <div id="advisorSettingsSubControls" class="settings-advisor-controls">
-            <div class="settings-advisor-row">
-              <label for="advisorStrategySelect" class="field-label settings-advisor-label">Стратегия подбора</label>
-              <select id="advisorStrategySelect" class="field-input settings-advisor-select">
-                <option value="balanced">Умный баланс (качество и экономия квот)</option>
-                <option value="max_quality">Максимум качества</option>
+          <hr class="divider" />
+          <div class="settings-section-title">Голосовой ввод</div>
+          <div id="voiceStatusPill" class="voice-status-pill">GigaAM-v3 E2E (ONNX CPU · 0% GPU) готов</div>
+          <div class="field-row-2">
+            <div>
+              <label class="field-label">Режим движка</label>
+              <select id="voiceEngineSelect" class="field-input">
+                <option value="gigaam">GigaAM-v3 E2E (Русский + IT · CPU, мгновенный поток)</option>
+                <option value="whisper">Локальный Whisper (Мультиязычный / English · CPU)</option>
+                <option value="groq">Гибрид: Поток GigaAM + финал Groq Cloud (если задан ключ)</option>
+                <option value="live">Встроенный распознаватель браузера (Web Speech)</option>
               </select>
             </div>
-            <label class="check-row settings-advisor-check">
-              <input type="checkbox" id="advisorAutoPickChk" checked />
-              <span>Автовыбор Топ-1 модели для новых вкладок «🚀 В Код»</span>
-            </label>
-            <label class="check-row settings-advisor-check">
-              <input type="checkbox" id="advisorComposerHintChk" checked />
-              <span>Тихие подсказки при явном перекосе модели в обычном поле ввода</span>
-            </label>
-            <details id="advisorCatalogDetails" class="advisor-catalog-details">
-              <summary class="advisor-catalog-summary">
-                <span class="advisor-catalog-summary-title">Паспорта доступных моделей</span>
-                <span id="advisorCatalogCountBadge" class="or-mini-pill is-muted">0</span>
-              </summary>
-              <div class="advisor-catalog-body">
-                <div class="advisor-catalog-toolbar">
-                  <span id="advisorCatalogSyncMeta" class="advisor-catalog-sync-meta">Автокалибровка новых моделей активна</span>
-                  <button type="button" id="advisorRecalibrateBtn" class="btn-secondary btn-xs advisor-recalibrate-btn">Обновить</button>
-                </div>
-                <div id="advisorCatalogList" class="advisor-catalog-list"></div>
-              </div>
-            </details>
-          </div>
-        </div>
-
-        <div id="settingsChatGptBlock" class="settings-or-card settings-cgpt-card">
-          <div class="settings-or-info">
-            <div class="settings-or-title-row">
-              <span class="settings-section-title">Личные аккаунты ChatGPT (Codex CLI)</span>
-              <span id="settingsCgptStatusBadge" class="or-mini-pill is-muted">Не подключён</span>
-            </div>
-            <div id="settingsCgptSubHint" class="settings-hint">
-              Личные подписки Plus / Pro / Team ($0 за токен), 5-часовые и недельные лимиты, мульти-аккаунт и авто-переключение — изолировано с шифрованием Fernet.
+            <div>
+              <label id="voiceModelLabel" class="field-label">Профиль качества</label>
+              <select id="voiceModelSelect" class="field-input">
+                <option value="accurate">Максимальная точность (GigaAM v3 RNN-T / Whisper small)</option>
+                <option value="fast">Сверхбыстрая (GigaAM v3 CTC / Whisper base)</option>
+              </select>
             </div>
           </div>
-          <div class="settings-or-actions">
-            <button type="button" id="openChatGptFromSettingsBtn" class="btn-secondary">Аккаунты и лимиты →</button>
+          <div class="field-row-2">
+            <div>
+              <label class="field-label">Язык диктовки</label>
+              <select id="voiceLangSelect" class="field-input">
+                <option value="ru">Русский + IT-термины</option>
+                <option value="en">English</option>
+                <option value="auto">Автоопределение</option>
+              </select>
+              <label class="field-label" style="margin-top: 10px;">Устройство микрофона</label>
+              <select id="voiceMicSelect" class="field-input">
+                <option value="">По умолчанию в системе</option>
+              </select>
+            </div>
+            <div class="checkbox-stack">
+              <label class="check-row" title="Расставляет знаки препинания (?, ., ,) и убирает слова-паразиты как в Antigravity">
+                <input id="voiceSmartFormatChk" type="checkbox" checked />
+                <span>Умное форматирование речи</span>
+              </label>
+              <label class="check-row">
+                <input id="voiceAutoSendChk" type="checkbox" />
+                <span>Авто-отправка после речи</span>
+              </label>
+              <label class="check-row">
+                <input id="voiceAutoStopChk" type="checkbox" />
+                <span>Авто-стоп при тишине (2 с)</span>
+              </label>
+            </div>
           </div>
-        </div>
-
-        <div id="settingsClaudeBlock" class="settings-or-card settings-cgpt-card settings-claude-card">
-          <div class="settings-or-info">
-            <div class="settings-or-title-row">
-              <span class="settings-section-title">Личные подписки Claude Code (Pro / Max / Team)</span>
-              <span id="settingsClaudeStatusText" class="or-mini-pill is-muted">Не подключён</span>
+          <hr class="divider" />
+          <div class="settings-storage-card">
+            <span class="settings-section-title">Память вкладки браузера</span>
+            <button type="button" id="unloadTabMemoryBtn" class="btn-secondary">🪶 Разгрузить память вкладки</button>
+          </div>
+        </section>
+        <section id="settingsPaneAi" class="settings-tab-pane hidden" role="tabpanel" aria-labelledby="settingsTabAiBtn">
+          <div class="settings-rules-block" id="userRulesSection">
+            <div class="settings-rules-head">
+              <div class="settings-section-title">Мои правила для ИИ</div>
+              <span id="userRulesCounter" class="rules-char-counter">0 симв. · 0 / 24 КБ</span>
             </div>
             <div class="settings-hint">
-              Официальный Claude Code CLI по вашей подписке Anthropic (0 ₽ за токен), лимиты 5 часов и недели, мульти-аккаунт с авто-переключением — изолировано и зашифровано.
+              Личные инструкции действуют во всех ваших чатах и проектах внутри Hub (например: язык ответов, стиль кода, формат разбора) — изолированно от других пользователей и десктопной программы Antigravity.
+            </div>
+            <textarea
+              id="userRulesTextarea"
+              rows="4"
+              class="field-textarea user-rules-textarea"
+              placeholder="Например: Отвечай кратко и по делу на русском языке. В Python-коде используй строгую типизацию и async/await, без лишней воды…"
+            ></textarea>
+            <div class="settings-rules-actions">
+              <button type="button" id="saveUserRulesBtn" class="btn-primary">Сохранить правила</button>
+              <span id="userRulesStatusHint" class="rules-saved-hint">Чистый изолированный контекст</span>
             </div>
           </div>
-          <div class="settings-or-actions">
-            <button type="button" id="openClaudeFromSettingsBtn" class="btn-secondary">Аккаунты и лимиты →</button>
-          </div>
-        </div>
 
-        <div id="settingsOpenRouterBlock" class="settings-or-card">
-          <div class="settings-or-info">
-            <div class="settings-or-title-row">
-              <span class="settings-section-title">Персональный шлюз OpenRouter</span>
-              <span id="settingsOrStatusBadge" class="or-mini-pill is-muted">Не подключён</span>
-            </div>
-            <div id="settingsOrSubHint" class="settings-hint">
-              Личный зашифрованный ключ (Fernet), правила вызова, потолки цены и телеметрия вызовов — строго приватно для вашей учётки.
-            </div>
-          </div>
-          <div class="settings-or-actions">
-            <button type="button" id="openOrFromSettingsBtn" class="btn-secondary">Ключ, правила и логи →</button>
-          </div>
-        </div>
-        <hr class="divider" />
-        <div class="info-grid" id="sysInfoGrid"></div>
-        <div class="settings-storage-card">
-          <button type="button" id="unloadTabMemoryBtn" class="btn-secondary">🪶 Разгрузить память вкладки</button>
-        </div>
-        <div id="adminSettingsSection">
-          <div class="settings-storage-card">
-            <span class="settings-section-title">⚡ База данных и хранилище</span>
-            <div id="storageHealthSummary" class="settings-hint" aria-live="polite">Загрузка…</div>
-            <button type="button" id="optimizeStorageBtn" class="btn-secondary">Оптимизировать БД и очистить мусор</button>
-          </div>
-          <hr class="divider" />
-          <div id="adminGlobalProxyCard" class="settings-proxy-card">
-            <div class="settings-proxy-head">
-              <div class="settings-proxy-title-wrap">
-                <span class="settings-section-title">Сеть и глобальный прокси</span>
-                <span id="globalProxyActiveBadge" class="or-mini-pill">Авто</span>
+          <div id="settingsModelAdvisorBlock" class="settings-or-card settings-advisor-card">
+            <div class="settings-advisor-head">
+              <div class="settings-or-title-row">
+                <span class="settings-section-title">🧭 Советник выбора нейросети</span>
+                <span id="advisorStatusBadge" class="or-mini-pill is-ok">Включён</span>
               </div>
-              <div class="settings-proxy-xray-wrap">
-                <span id="xrayCoreStatusPill" class="proxy-xray-pill">Xray: проверка…</span>
-                <button type="button" id="installXrayCoreBtn" class="btn-secondary btn-sm">Скачать Xray-core</button>
+              <label class="settings-advisor-toggle">
+                <input type="checkbox" id="advisorEnabledChk" checked />
+                <span>Включён</span>
+              </label>
+            </div>
+            <div class="settings-hint">
+              Мгновенно ранжирует доступные вам нейросети под сложность задачи и остаток 5-часовых квот (0 мс задержки, синхронизация между устройствами).
+            </div>
+            <div id="advisorSettingsSubControls" class="settings-advisor-controls">
+              <div class="settings-advisor-row">
+                <label for="advisorStrategySelect" class="field-label settings-advisor-label">Стратегия подбора</label>
+                <select id="advisorStrategySelect" class="field-input settings-advisor-select">
+                  <option value="balanced">Умный баланс (качество и экономия квот)</option>
+                  <option value="max_quality">Максимум качества</option>
+                </select>
               </div>
-            </div>
-            <div id="globalProxyModeGroup" class="proxy-mode-seg" role="radiogroup" aria-label="Глобальный режим прокси">
-              <button type="button" class="proxy-mode-btn active" data-proxy-mode="system_auto">Системный (авто)</button>
-              <button type="button" class="proxy-mode-btn" data-proxy-mode="custom">Свой прокси / Xray</button>
-              <button type="button" class="proxy-mode-btn" data-proxy-mode="direct">Выкл (Напрямую)</button>
-            </div>
-            <div id="globalProxyDetectedInfo" class="proxy-detected-info">Проверка системного прокси Windows…</div>
-            <div id="globalProxyCustomBox" class="proxy-custom-box hidden">
-              <label class="field-label" for="globalProxySpecInput">Адрес прокси или ссылка Xray (VLESS / VMess / Trojan / Shadowsocks / SOCKS5 / HTTP)</label>
-              <input
-                id="globalProxySpecInput"
-                type="text"
-                class="field-input proxy-spec-input"
-                autocomplete="off"
-                spellcheck="false"
-                placeholder="vless://... | vmess://... | trojan://... | ss://... | socks5://user:pass@host:port | http://host:port"
-              />
-              <div class="settings-hint">Секреты шифруются в БД (Fernet PBKDF2) и передаются в Xray через <code>stdin</code> без записи конфигов на диск.</div>
-            </div>
-            <div class="proxy-actions-row">
-              <button type="button" id="saveGlobalProxyBtn" class="btn-primary btn-sm">Сохранить маршрут</button>
-              <button type="button" id="testGlobalProxyBtn" class="btn-secondary btn-sm">Проверить IP / пинг</button>
-              <span id="globalProxyTestResult" class="proxy-test-badge hidden"></span>
+              <label class="check-row settings-advisor-check">
+                <input type="checkbox" id="advisorAutoPickChk" checked />
+                <span>Автовыбор Топ-1 модели для новых вкладок «🚀 В Код»</span>
+              </label>
+              <label class="check-row settings-advisor-check">
+                <input type="checkbox" id="advisorComposerHintChk" checked />
+                <span>Тихие подсказки при явном перекосе модели в обычном поле ввода</span>
+              </label>
+              <details id="advisorCatalogDetails" class="advisor-catalog-details">
+                <summary class="advisor-catalog-summary">
+                  <span class="advisor-catalog-summary-title">Паспорта доступных моделей</span>
+                  <span id="advisorCatalogCountBadge" class="or-mini-pill is-muted">0</span>
+                </summary>
+                <div class="advisor-catalog-body">
+                  <div class="advisor-catalog-toolbar">
+                    <span id="advisorCatalogSyncMeta" class="advisor-catalog-sync-meta">Автокалибровка новых моделей активна</span>
+                    <button type="button" id="advisorRecalibrateBtn" class="btn-secondary btn-xs advisor-recalibrate-btn">Обновить</button>
+                  </div>
+                  <div id="advisorCatalogList" class="advisor-catalog-list"></div>
+                </div>
+              </details>
             </div>
           </div>
-          <hr class="divider" />
-          <div id="updatesSettingsCard" class="settings-or-card updates-settings-card hidden">
+          <div class="settings-section-title">Подключённые провайдеры и квоты</div>
+          <div id="settingsProvidersList">
+            <div id="settingsGoogleBlock" class="settings-or-card">
+              <div class="settings-or-info">
+                <div class="settings-or-title-row">
+                  <span class="settings-section-title">Google AI (Gemini / Claude CLI)</span>
+                  <span id="settingsGoogleStatusBadge" class="or-mini-pill is-muted">Статус CLI</span>
+                </div>
+                <div id="settingsGoogleSubHint" class="settings-hint">Остаток 5-часовых квот</div>
+              </div>
+              <div class="settings-or-actions">
+                <button type="button" id="openQuotaFromSettingsBtn" class="btn-secondary">Квоты и пул →</button>
+              </div>
+            </div>
+            <div id="settingsChatGptBlock" class="settings-or-card settings-cgpt-card">
+              <div class="settings-or-info">
+                <div class="settings-or-title-row">
+                  <span class="settings-section-title">Личные аккаунты ChatGPT (Codex CLI)</span>
+                  <span id="settingsCgptStatusBadge" class="or-mini-pill is-muted">Не подключён</span>
+                </div>
+                <div id="settingsCgptSubHint" class="settings-hint">
+                  Личные подписки Plus / Pro / Team ($0 за токен), 5-часовые и недельные лимиты, мульти-аккаунт и авто-переключение — изолировано с шифрованием Fernet.
+                </div>
+              </div>
+              <div class="settings-or-actions">
+                <button type="button" id="openChatGptFromSettingsBtn" class="btn-secondary">Аккаунты и лимиты →</button>
+              </div>
+            </div>
+
+            <div id="settingsClaudeBlock" class="settings-or-card settings-cgpt-card settings-claude-card">
+              <div class="settings-or-info">
+                <div class="settings-or-title-row">
+                  <span class="settings-section-title">Личные подписки Claude Code (Pro / Max / Team)</span>
+                  <span id="settingsClaudeStatusText" class="or-mini-pill is-muted">Не подключён</span>
+                </div>
+                <div class="settings-hint">
+                  Официальный Claude Code CLI по вашей подписке Anthropic (0 ₽ за токен), лимиты 5 часов и недели, мульти-аккаунт с авто-переключением — изолировано и зашифровано.
+                </div>
+              </div>
+              <div class="settings-or-actions">
+                <button type="button" id="openClaudeFromSettingsBtn" class="btn-secondary">Аккаунты и лимиты →</button>
+              </div>
+            </div>
+
+            <div id="settingsOpenRouterBlock" class="settings-or-card">
+              <div class="settings-or-info">
+                <div class="settings-or-title-row">
+                  <span class="settings-section-title">Персональный шлюз OpenRouter</span>
+                  <span id="settingsOrStatusBadge" class="or-mini-pill is-muted">Не подключён</span>
+                </div>
+                <div id="settingsOrSubHint" class="settings-hint">
+                  Личный зашифрованный ключ (Fernet), правила вызова, потолки цены и телеметрия вызовов — строго приватно для вашей учётки.
+                </div>
+              </div>
+              <div class="settings-or-actions">
+                <button type="button" id="openOrFromSettingsBtn" class="btn-secondary">Ключ, правила и логи →</button>
+              </div>
+            </div>
+          </div>
+        </section>
+        <section id="settingsPaneServer" class="settings-tab-pane hidden" role="tabpanel" aria-labelledby="settingsTabServerBtn">
+          <div id="adminSettingsSection" class="hidden">
+            <div id="updatesSettingsCard" class="settings-or-card updates-settings-card hidden">
+              <div class="settings-or-info">
+                <div class="settings-or-title-row upd-inline">
+                  <span class="settings-section-title">Обновления и релизы GitHub</span>
+                  <span id="updatesCurrentVerBadge" class="or-mini-pill">v1.0.0</span>
+                  <span id="updatesSettingsStatusPill" class="or-mini-pill is-muted" role="status">Не проверено</span>
+                </div>
+                <div id="updatesSettingsHint" class="settings-hint">Обновление с копией базы и выпуск релизов.</div>
+              </div>
+              <div class="settings-or-actions upd-inline">
+                <button id="openUpdatesModalBtn" type="button" class="btn-secondary btn-sm" aria-describedby="updatesSettingsHint">Открыть Центр обновлений</button>
+                <button id="quickCheckUpdatesBtn" type="button" class="btn-secondary btn-sm">Проверить</button>
+              </div>
+            </div>
+            <div id="gdriveSettingsCard" class="settings-or-card gdrive-settings-card">
+              <div class="settings-or-info gdrive-settings-info">
+                <div class="settings-or-title-row gdrive-settings-title-row">
+                  <span class="settings-section-title gdrive-settings-heading">
+                    <svg class="ui-ico ui-ico-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" /></svg>
+                    <span>Облачное зеркало Google Drive</span>
+                  </span>
+                  <span id="gdriveSettingsStatusPill" class="or-mini-pill is-muted">Не подключён</span>
+                </div>
+                <div class="settings-hint">
+                  Резервные копии диалогов, паспортов и кода.
+                </div>
+              </div>
+              <div class="settings-or-actions gdrive-settings-actions">
+                <button type="button" id="openGdriveModalBtn" class="btn-secondary btn-sm">Настроить / Открыть</button>
+                <button type="button" id="quickGdriveSyncBtn" class="btn-primary btn-sm hidden">Синхронизировать</button>
+              </div>
+            </div>
+            <div id="adminGlobalProxyCard" class="settings-proxy-card">
+              <div class="settings-proxy-head">
+                <div class="settings-proxy-title-wrap">
+                  <span class="settings-section-title">Сеть и глобальный прокси</span>
+                  <span id="globalProxyActiveBadge" class="or-mini-pill">Авто</span>
+                </div>
+                <div class="settings-proxy-xray-wrap">
+                  <span id="xrayCoreStatusPill" class="proxy-xray-pill">Xray: проверка…</span>
+                  <button type="button" id="installXrayCoreBtn" class="btn-secondary btn-sm">Скачать Xray-core</button>
+                </div>
+              </div>
+              <div id="globalProxyModeGroup" class="proxy-mode-seg" role="radiogroup" aria-label="Глобальный режим прокси">
+                <button type="button" class="proxy-mode-btn active" data-proxy-mode="system_auto">Системный (авто)</button>
+                <button type="button" class="proxy-mode-btn" data-proxy-mode="custom">Свой прокси / Xray</button>
+                <button type="button" class="proxy-mode-btn" data-proxy-mode="direct">Выкл (Напрямую)</button>
+              </div>
+              <div id="globalProxyDetectedInfo" class="proxy-detected-info">Проверка системного прокси Windows…</div>
+              <div id="globalProxyCustomBox" class="proxy-custom-box hidden">
+                <label class="field-label" for="globalProxySpecInput">Адрес прокси или ссылка Xray (VLESS / VMess / Trojan / Shadowsocks / SOCKS5 / HTTP)</label>
+                <input
+                  id="globalProxySpecInput"
+                  type="text"
+                  class="field-input proxy-spec-input"
+                  autocomplete="off"
+                  spellcheck="false"
+                  placeholder="vless://... | vmess://... | trojan://... | ss://... | socks5://user:pass@host:port | http://host:port"
+                />
+                <div class="settings-hint">Секреты шифруются в БД (Fernet PBKDF2) и передаются в Xray через <code>stdin</code> без записи конфигов на диск.</div>
+              </div>
+              <div class="proxy-actions-row">
+                <button type="button" id="saveGlobalProxyBtn" class="btn-primary btn-sm">Сохранить маршрут</button>
+                <button type="button" id="testGlobalProxyBtn" class="btn-secondary btn-sm">Проверить IP / пинг</button>
+                <span id="globalProxyTestResult" class="proxy-test-badge hidden"></span>
+              </div>
+            </div>
+            <div class="settings-section-title">Система</div>
+            <div class="info-grid" id="sysInfoGrid"></div>
+            <div class="settings-storage-card">
+              <span class="settings-section-title">⚡ База данных и хранилище</span>
+              <div id="storageHealthSummary" class="settings-hint" aria-live="polite">Загрузка…</div>
+              <button type="button" id="optimizeStorageBtn" class="btn-secondary">Оптимизировать БД и очистить мусор</button>
+            </div>
+            <div class="settings-section-title">Сессия CLI и администрирование</div>
+            <div id="settingsAccountBadge" class="settings-account-badge"></div>
+            <div id="accountStatusPill" class="voice-status-pill">Сессия CLI активна · автоподхват включён</div>
+            <div class="settings-hint">При смене аккаунта в программе Antigravity сессия, модели и чаты подтягиваются автоматически без команд в терминале.</div>
+            <div class="settings-btn-row">
+              <button type="button" id="openUsersFromSettingsBtn" class="btn-primary">Пользователи и общие проекты</button>
+              <button type="button" id="syncAccountBtn" class="btn-secondary">Обновить сессию</button>
+              <button type="button" id="updateCliBtn" class="btn-secondary">Проверить / обновить CLI</button>
+              <button type="button" id="openCliAuthBtn" class="btn-secondary">Окно входа CLI</button>
+              <button type="button" id="restartServerBtn" class="btn-danger-outline">Перезапустить сервер Hub</button>
+            </div>
+          </div>
+        </section>
+        <section id="settingsPaneAccount" class="settings-tab-pane hidden" role="tabpanel" aria-labelledby="settingsTabAccountBtn">
+          <div id="settingsProfileCard" class="settings-or-card">
             <div class="settings-or-info">
-              <div class="settings-or-title-row upd-inline">
-                <span class="settings-section-title">Обновления и релизы GitHub</span>
-                <span id="updatesCurrentVerBadge" class="or-mini-pill">v1.0.0</span>
-                <span id="updatesSettingsStatusPill" class="or-mini-pill is-muted" role="status">Не проверено</span>
+              <div class="settings-or-title-row">
+                <strong id="settingsProfileIdentity"></strong>
+                <span id="settingsProfileRoleBadge" class="or-mini-pill is-muted"></span>
               </div>
-              <div id="updatesSettingsHint" class="settings-hint">Проверка версий на GitHub, обновление с резервной копией базы и выпуск публичных релизов.</div>
+              <div id="settingsProfileSubHint" class="settings-hint"></div>
             </div>
-            <div class="settings-or-actions upd-inline">
-              <button id="openUpdatesModalBtn" type="button" class="btn-secondary btn-sm" aria-describedby="updatesSettingsHint">Открыть Центр обновлений</button>
-              <button id="quickCheckUpdatesBtn" type="button" class="btn-secondary btn-sm">Проверить</button>
+            <div class="settings-or-actions">
+              <button type="button" id="openQrFromSettingsBtn" class="btn-secondary">📱 Подключить смартфон по QR</button>
             </div>
           </div>
           <hr class="divider" />
-          <div id="gdriveSettingsCard" class="settings-or-card gdrive-settings-card">
-            <div class="settings-or-info gdrive-settings-info">
-              <div class="settings-or-title-row gdrive-settings-title-row">
-                <span class="settings-section-title gdrive-settings-heading">
-                  <svg class="ui-ico ui-ico-xs" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" /></svg>
-                  <span>Облачное зеркало Google Drive</span>
-                </span>
-                <span id="gdriveSettingsStatusPill" class="or-mini-pill is-muted">Не подключён</span>
-              </div>
-              <div class="settings-hint">
-                Односторонний бэкап всех диалогов, Паспортов и чистого кода проектов через <code>drive.file</code> без баз и мусора.
-              </div>
+          <div class="settings-section-title">Смена пароля / ПИН-кода вашей учётки</div>
+          <div class="field-row-2">
+            <div>
+              <label class="field-label">Текущий пароль или ПИН</label>
+              <input id="oldPinInput" type="password" class="field-input" placeholder="Текущий пароль / ПИН" />
             </div>
-            <div class="settings-or-actions gdrive-settings-actions">
-              <button type="button" id="openGdriveModalBtn" class="btn-secondary btn-sm">Настроить / Открыть</button>
-              <button type="button" id="quickGdriveSyncBtn" class="btn-primary btn-sm hidden">Синхронизировать</button>
+            <div>
+              <label class="field-label">Новый пароль или ПИН (мин. 4 симв.)</label>
+              <input id="newPinInput" type="password" class="field-input" placeholder="Новый пароль или ПИН" />
             </div>
           </div>
-          <hr class="divider" />
-          <div class="settings-section-title">Администрирование и аккаунт Google</div>
-          <div id="settingsAccountBadge" class="settings-account-badge"></div>
-          <div id="accountStatusPill" class="voice-status-pill">Сессия CLI активна · автоподхват включён</div>
-          <div class="settings-hint">При смене аккаунта в программе Antigravity сессия, модели и чаты подтягиваются автоматически без команд в терминале.</div>
           <div class="settings-btn-row">
-            <button type="button" id="openUsersFromSettingsBtn" class="btn-primary">Пользователи и общие проекты</button>
-            <button type="button" id="openQuotaFromSettingsBtn" class="btn-secondary">Квоты, почта и токены</button>
-            <button type="button" id="syncAccountBtn" class="btn-secondary">Обновить сессию</button>
-            <button type="button" id="updateCliBtn" class="btn-secondary">Проверить / обновить CLI</button>
-            <button type="button" id="openCliAuthBtn" class="btn-secondary">Окно входа CLI</button>
-            <button type="button" id="restartServerBtn" class="btn-danger-outline">Перезапустить сервер Hub</button>
+            <button type="button" id="savePinBtn" class="btn-primary">Обновить пароль / ПИН</button>
+            <button type="button" id="logoutBtn" class="btn-danger-outline">Выйти из аккаунта</button>
           </div>
-        </div>
-        <hr class="divider" />
-        <div class="settings-section-title">Голосовой ввод</div>
-        <div id="voiceStatusPill" class="voice-status-pill">GigaAM-v3 E2E (ONNX CPU · 0% GPU) готов</div>
-        <div class="field-row-2">
-          <div>
-            <label class="field-label">Режим движка</label>
-            <select id="voiceEngineSelect" class="field-input">
-              <option value="gigaam">GigaAM-v3 E2E (Русский + IT · CPU, мгновенный поток)</option>
-              <option value="whisper">Локальный Whisper (Мультиязычный / English · CPU)</option>
-              <option value="groq">Гибрид: Поток GigaAM + финал Groq Cloud (если задан ключ)</option>
-              <option value="live">Встроенный распознаватель браузера (Web Speech)</option>
-            </select>
-          </div>
-          <div>
-            <label id="voiceModelLabel" class="field-label">Профиль качества</label>
-            <select id="voiceModelSelect" class="field-input">
-              <option value="accurate">Максимальная точность (GigaAM v3 RNN-T / Whisper small)</option>
-              <option value="fast">Сверхбыстрая (GigaAM v3 CTC / Whisper base)</option>
-            </select>
-          </div>
-        </div>
-        <div class="field-row-2">
-          <div>
-            <label class="field-label">Язык диктовки</label>
-            <select id="voiceLangSelect" class="field-input">
-              <option value="ru">Русский + IT-термины</option>
-              <option value="en">English</option>
-              <option value="auto">Автоопределение</option>
-            </select>
-            <label class="field-label" style="margin-top: 10px;">Устройство микрофона</label>
-            <select id="voiceMicSelect" class="field-input">
-              <option value="">По умолчанию в системе</option>
-            </select>
-          </div>
-          <div class="checkbox-stack">
-            <label class="check-row" title="Расставляет знаки препинания (?, ., ,) и убирает слова-паразиты как в Antigravity">
-              <input id="voiceSmartFormatChk" type="checkbox" checked />
-              <span>Умное форматирование речи</span>
-            </label>
-            <label class="check-row">
-              <input id="voiceAutoSendChk" type="checkbox" />
-              <span>Авто-отправка после речи</span>
-            </label>
-            <label class="check-row">
-              <input id="voiceAutoStopChk" type="checkbox" />
-              <span>Авто-стоп при тишине (2 с)</span>
-            </label>
-          </div>
-        </div>
-        <hr class="divider" />
-        <div class="settings-section-title">Смена пароля / ПИН-кода вашей учётки</div>
-        <div class="field-row-2">
-          <div>
-            <label class="field-label">Текущий пароль или ПИН</label>
-            <input id="oldPinInput" type="password" class="field-input" placeholder="Текущий пароль / ПИН" />
-          </div>
-          <div>
-            <label class="field-label">Новый пароль или ПИН (мин. 4 симв.)</label>
-            <input id="newPinInput" type="password" class="field-input" placeholder="Новый пароль или ПИН" />
-          </div>
-        </div>
-        <div class="settings-btn-row">
-          <button type="button" id="savePinBtn" class="btn-primary">Обновить пароль / ПИН</button>
-          <button type="button" id="logoutBtn" class="btn-danger-outline">Выйти из аккаунта</button>
-        </div>
+        </section>
       </div>
     </div>
   </div>
@@ -3634,7 +3674,7 @@
 <div id="welcomeProjPopover" class="new-action-popover welcome-proj-popover hidden ui-popover" role="menu"></div>
   <script src="/static/vendor/marked.min.js"></script>
   <script src="/static/vendor/highlight.min.js"></script>
-  <script src="/static/ui-shell.js?v=159"></script>
-  <script src="/static/app.js?v=159"></script>
+  <script src="/static/ui-shell.js?v=161"></script>
+  <script src="/static/app.js?v=161"></script>
 </body>
 </html>

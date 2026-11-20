@@ -60,6 +60,7 @@ GOLDEN = tuple(
         "silent_empty_turn_recovery_v157",
         "release_and_updater_v158",
         "ui_updates_and_publisher_v159",
+        "ui_settings_tabs_v160",
     )
 )
 
