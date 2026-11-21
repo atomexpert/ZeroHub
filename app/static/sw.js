@@ -1,11 +1,11 @@
-const CACHE_NAME = "agy-hub-v161";
+const CACHE_NAME = "agy-hub-v170";
 const SHELL_ASSETS = [
   "/",
   "/manifest.json",
-  "/static/styles.css?v=161",
-  "/static/ui-system.css?v=161",
-  "/static/ui-shell.js?v=161",
-  "/static/app.js?v=161",
+  "/static/styles.css?v=170",
+  "/static/ui-system.css?v=170",
+  "/static/ui-shell.js?v=170",
+  "/static/app.js?v=170",
   "/static/icon.svg",
   "/static/icon-192.png",
   "/static/icon-512.png",
@@ -15,30 +15,53 @@ const SHELL_ASSETS = [
   "/static/vendor/github.min.css"
 ];
 
+function createOfflineResponse() {
+  return new Response("", { status: 503, statusText: "Offline" });
+}
+
+function cachePutSafe(event, key, response) {
+  const putPromise = caches
+    .open(CACHE_NAME)
+    .then((cache) => cache.put(key, response))
+    .catch(() => {});
+  if (event && typeof event.waitUntil === "function") {
+    event.waitUntil(putPromise);
+  }
+}
+
 self.addEventListener("install", (event) => {
   event.waitUntil(
-    caches.open(CACHE_NAME).then((cache) =>
-      Promise.all(
-        SHELL_ASSETS.map((url) =>
-          fetch(url, { cache: "no-cache" }).then((resp) => {
-            if (resp.ok) return cache.put(url, resp);
-          })
+    caches
+      .open(CACHE_NAME)
+      .then((cache) =>
+        Promise.all(
+          SHELL_ASSETS.map((url) =>
+            fetch(url, { cache: "no-cache" }).then((resp) => {
+              if (!resp || !resp.ok) {
+                throw new Error(`Precache failed (${resp ? resp.status : "network"}): ${url}`);
+              }
+              return cache.put(url, resp);
+            })
+          )
         )
       )
-    )
+      .then(() => self.skipWaiting())
   );
-  self.skipWaiting();
 });
 
 self.addEventListener("activate", (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k))
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((k) => k.startsWith("agy-hub-") && k !== CACHE_NAME)
+            .map((k) => caches.delete(k))
+        )
       )
-    )
+      .then(() => self.clients.claim())
   );
-  self.clients.claim();
 });
 
 self.addEventListener("fetch", (event) => {
@@ -61,30 +84,69 @@ self.addEventListener("fetch", (event) => {
     event.respondWith(
       caches.match(event.request).then((cached) => {
         if (cached) return cached;
-        return fetch(event.request).then((resp) => {
-          if (resp && resp.status === 200) {
-            const clone = resp.clone();
-            caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
-          }
-          return resp;
-        });
+        return fetch(event.request)
+          .then((resp) => {
+            if (resp && resp.status === 200) {
+              cachePutSafe(event, event.request, resp.clone());
+            }
+            return resp;
+          })
+          .catch(() => createOfflineResponse());
       })
     );
     return;
   }
+  const isNavigate = event.request.mode === "navigate";
+  const cacheKey = isNavigate ? "/" : event.request;
   event.respondWith(
     fetch(event.request)
       .then((resp) => {
-        if (resp && resp.status === 200 && event.request.method === "GET") {
-          const clone = resp.clone();
-          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, clone));
+        if (resp && resp.status === 200) {
+          cachePutSafe(event, cacheKey, resp.clone());
         }
         return resp;
       })
       .catch(() =>
-        caches.match(event.request).then(
-          (cached) => cached || (event.request.mode === "navigate" ? caches.match("/") : undefined)
-        )
+        caches.match(cacheKey).then((cached) => cached || createOfflineResponse())
       )
   );
+});
+
+self.addEventListener("push", event => {
+  let payload = {};
+  try {
+    payload = event.data?.json() || {};
+  } catch {
+    payload = { body: event.data?.text() || "" };
+  }
+  event.waitUntil(self.registration.showNotification(payload.title || "ZeroHub", {
+    body: payload.body || "",
+    icon: "/static/icon-192.png",
+    badge: "/static/icon-192.png",
+    tag: payload.tag || "zerohub-alert",
+    renotify: true,
+    data: payload.data || {},
+  }));
+});
+
+self.addEventListener("notificationclick", event => {
+  event.notification.close();
+  const data = event.notification.data || {};
+  event.waitUntil((async () => {
+    let target = new URL("/", self.location.origin);
+    try {
+      const requested = new URL(data.url || "/", self.location.origin);
+      if (requested.origin === self.location.origin) target = requested;
+    } catch {}
+    const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+    for (const client of windows) {
+      if (new URL(client.url).origin !== self.location.origin) continue;
+      try {
+        await client.focus();
+        client.postMessage({ ...data, type: "zerohub_notification_click" });
+        return;
+      } catch {}
+    }
+    await self.clients.openWindow(target.href);
+  })());
 });

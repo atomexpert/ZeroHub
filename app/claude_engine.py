@@ -409,19 +409,21 @@ async def _terminate_proc_tree(proc: Optional[asyncio.subprocess.Process]) -> No
     if proc.returncode is None:
         pid = proc.pid
         if IS_WINDOWS and pid:
+            tk_ok = False
             try:
-                kill_env = apply_isolated_home_to_env(os.environ.copy(), ensure_user_cli_home("_system"))
-                await asyncio.to_thread(
+                tk_res = await asyncio.to_thread(
                     subprocess.run,
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env=kill_env,
                     timeout=3.0,
                     **subprocess_hidden_kwargs(),
                 )
+                tk_ok = tk_res.returncode == 0
             except Exception:
+                tk_ok = False
+            if not tk_ok and proc.returncode is None:
                 try:
                     proc.kill()
                 except Exception:
@@ -437,7 +439,15 @@ async def _terminate_proc_tree(proc: Optional[asyncio.subprocess.Process]) -> No
         try:
             await asyncio.wait_for(proc.wait(), timeout=2.0)
         except Exception:
-            pass
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                except Exception:
+                    pass
     transport = getattr(proc, "_transport", None)
     if transport is not None:
         try:
@@ -601,10 +611,13 @@ def _http_get_usage_sync(
             return int(resp.status), json.loads(body) if body else {}
     except urllib.error.HTTPError as exc:
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            body = ""
-        return int(exc.code), body[:300]
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            return int(exc.code), body[:300]
+        finally:
+            exc.close()
     except Exception as exc:  # network / proxy / JSON
         return 0, str(exc)[:300]
 
@@ -2751,7 +2764,8 @@ async def stream_claude_turn(
             await cancel_chat_sandbox_execs(chat_id)
         except Exception:
             pass
-        ACTIVE_RUNS.pop(chat_id, None)
+        if ACTIVE_RUNS.get(chat_id) is run_state:
+            ACTIVE_RUNS.pop(chat_id, None)
 
 
 async def run_one_shot_claude_prompt(

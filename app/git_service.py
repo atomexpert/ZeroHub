@@ -149,6 +149,16 @@ def _get_project_lock(resolved_dir: Path) -> threading.RLock:
         return lock
 
 
+def discard_project_lock(proj_dir: Path | str) -> None:
+    try:
+        resolved = Path(proj_dir).resolve()
+    except OSError:
+        resolved = Path(proj_dir)
+    key = str(resolved).replace("\\", "/").lower() if config.IS_WINDOWS else str(resolved)
+    with _LOCKS_GUARD:
+        _PROJECT_LOCKS.pop(key, None)
+
+
 def _validate_project_dir(proj_dir: Path) -> Path:
     if proj_dir is None:
         raise GitServiceError("Путь проекта не указан", status_code=400)
@@ -191,6 +201,39 @@ def is_blocked_git_path(rel_path: str) -> bool:
     if name_low in ALLOWED_EXACT_NAMES:
         return False
     return any(fnmatch.fnmatchcase(name_low, pat) for pat in BLOCKED_NAME_PATTERNS)
+
+
+def _is_nested_git_repo_path(resolved_dir: Path, rel_path: str) -> bool:
+    relative = Path(rel_path)
+    if relative.anchor or ".." in relative.parts:
+        return False
+    current = resolved_dir
+    for part in relative.parts:
+        current /= part
+        if not current.is_dir() or config._is_junction_or_symlink(current):
+            break
+        if os.path.lexists(current / ".git"):
+            return True
+    return False
+
+
+def _is_excluded_git_path(resolved_dir: Path, rel_path: str) -> bool:
+    return is_blocked_git_path(rel_path) or _is_nested_git_repo_path(resolved_dir, rel_path)
+
+
+def _filter_out_git_ignored_paths(resolved_dir: Path, rel_paths: list[str]) -> list[str]:
+    ignored: set[str] = set()
+    for start in range(0, len(rel_paths), 256):
+        batch = rel_paths[start : start + 256]
+        rc, output, error = _exec_git_bytes(
+            resolved_dir, ["check-ignore", "-z", "--stdin"],
+            input_data=("\x00".join("./" + path for path in batch) + "\x00").encode("utf-8"), timeout=15.0,
+        )
+        if rc not in (0, 1):
+            raise GitServiceError(f"git check-ignore: {error.strip()}", status_code=500)
+        ignored.update(path.decode("utf-8", errors="replace").removeprefix("./")
+                       for path in output.split(b"\x00") if path)
+    return [path for path in rel_paths if path not in ignored]
 
 
 def _build_git_env(
@@ -269,6 +312,7 @@ def _exec_git_bytes(
     *,
     env: Optional[dict[str, str]] = None,
     timeout: float = 20.0,
+    input_data: bytes | None = None,
 ) -> tuple[int, bytes, str]:
     git_bin = _resolve_git_bin()
     eff_env = env if env is not None else _build_git_env(cwd)
@@ -277,7 +321,7 @@ def _exec_git_bytes(
             [git_bin, "-c", "core.quotepath=false", *args],
             cwd=str(cwd),
             env=eff_env,
-            stdin=subprocess.DEVNULL,
+            **({'stdin': subprocess.DEVNULL} if input_data is None else {'input': input_data}),
             capture_output=True,
             timeout=timeout,
             **config.subprocess_hidden_kwargs(),
@@ -541,7 +585,7 @@ def get_project_git_status(proj_dir: Path, limit: int = 15) -> dict[str, Any]:
             # Count ignored secrets/databases/files without inflating on standard .git/ internals
             ignored_or_blocked_count += 1
             continue
-        if is_blocked_git_path(rel_path) or (orig_path and is_blocked_git_path(orig_path)):
+        if _is_excluded_git_path(resolved, rel_path) or (orig_path and _is_excluded_git_path(resolved, orig_path)):
             ignored_or_blocked_count += 1
             continue
         staged = xy[0] not in (" ", "?", "!")
@@ -586,7 +630,7 @@ def _resolve_verified_commit_sha(resolved_dir: Path, raw_commit: str) -> str:
     return out.strip()
 
 
-def _filter_patch_sections_against_blocked_paths(patch_text: str) -> str:
+def _filter_patch_sections_against_blocked_paths(resolved_dir: Path, patch_text: str) -> str:
     """Strip any `diff --git a/... b/...` block touching a blocked secret/DB path."""
     if not patch_text or "diff --git " not in patch_text:
         return patch_text
@@ -601,7 +645,7 @@ def _filter_patch_sections_against_blocked_paths(patch_text: str) -> str:
         if m:
             p_a = normalize_rel_git_path(m.group(1))
             p_b = normalize_rel_git_path(m.group(2))
-            if is_blocked_git_path(p_a) or is_blocked_git_path(p_b):
+            if _is_excluded_git_path(resolved_dir, p_a) or _is_excluded_git_path(resolved_dir, p_b):
                 continue
         kept.append(chunk)
     return "".join(kept)
@@ -653,7 +697,7 @@ def get_project_git_diff(
         filter_rel = normalize_rel_git_path(path)
         if not filter_rel or ".." in filter_rel.split("/"):
             raise GitServiceError("Недопустимый относительный путь файла", status_code=400)
-        if is_blocked_git_path(filter_rel):
+        if _is_excluded_git_path(resolved, filter_rel):
             return {
                 "ok": True,
                 "diff": "",
@@ -672,13 +716,22 @@ def get_project_git_diff(
 
     if commit is not None and str(commit).strip():
         sha = _resolve_verified_commit_sha(resolved, str(commit))
-        show_args = ["show", "--stat", "--patch", sha]
-        if filter_rel:
-            show_args.extend(["--", filter_rel])
+        pathspec = [f":(literal){filter_rel}"] if filter_rel else []
+        rc_names, names, err_names = _exec_git_bytes(
+            resolved, ["show", "--format=", "--name-only", "--no-renames", "-z", sha, "--", *pathspec],
+            timeout=15.0,
+        )
+        if rc_names != 0:
+            raise GitServiceError(f"git show: {err_names.strip()}", status_code=400)
+        for name in names.split(b"\x00"):
+            rel = normalize_rel_git_path(name.decode("utf-8", errors="replace"))
+            if rel and _is_excluded_git_path(resolved, rel):
+                pathspec.append(f":(literal,exclude){rel}")
+        show_args = ["show", "--stat", "--patch", sha, "--", *pathspec]
         rc, out, err = _exec_git_raw(resolved, show_args, timeout=15.0)
         if rc != 0:
             raise GitServiceError(f"Не удалось прочитать дифф коммита: {err.strip()}", status_code=400)
-        cleaned = _filter_patch_sections_against_blocked_paths(out)
+        cleaned = _filter_patch_sections_against_blocked_paths(resolved, out)
         truncated = len(cleaned) > eff_max
         if truncated:
             cleaned = cleaned[:eff_max] + "\n... [вывод диффа обрезан по лимиту]"
@@ -696,7 +749,7 @@ def get_project_git_diff(
     tracked_paths: list[str] = []
     untracked_paths: list[str] = []
     for xy, rel_path, orig_path in entries:
-        if is_blocked_git_path(rel_path) or (orig_path and is_blocked_git_path(orig_path)):
+        if _is_excluded_git_path(resolved, rel_path) or (orig_path and _is_excluded_git_path(resolved, orig_path)):
             continue
         if filter_rel and rel_path != filter_rel and orig_path != filter_rel:
             continue
@@ -717,17 +770,17 @@ def get_project_git_diff(
             if head_sha:
                 rc_d, out_d, _ = _exec_git_raw(
                     resolved,
-                    ["diff", "--no-ext-diff", "HEAD", "--", *batch],
+                    ["--literal-pathspecs", "diff", "--no-ext-diff", "HEAD", "--", *batch],
                     timeout=15.0,
                 )
                 # Replace binary patch payloads cleanly while keeping `Binary files ... differ`
                 if rc_d == 0 and out_d.strip():
-                    diff_parts.append(_filter_patch_sections_against_blocked_paths(out_d))
+                    diff_parts.append(_filter_patch_sections_against_blocked_paths(resolved, out_d))
             else:
-                for base_cmd in (["diff", "--no-ext-diff", "--cached", "--", *batch], ["diff", "--no-ext-diff", "--", *batch]):
+                for base_cmd in (["--literal-pathspecs", "diff", "--no-ext-diff", "--cached", "--", *batch], ["--literal-pathspecs", "diff", "--no-ext-diff", "--", *batch]):
                     rc_d, out_d, _ = _exec_git_raw(resolved, base_cmd, timeout=15.0)
                     if rc_d == 0 and out_d.strip():
-                        diff_parts.append(_filter_patch_sections_against_blocked_paths(out_d))
+                        diff_parts.append(_filter_patch_sections_against_blocked_paths(resolved, out_d))
 
     current_len = sum(len(part) for part in diff_parts)
     for u_rel in untracked_paths:
@@ -844,9 +897,35 @@ def _unstage_paths(resolved_dir: Path, paths_to_unstage: list[str], *, has_head:
     for start in range(0, len(paths_to_unstage), 60):
         batch = paths_to_unstage[start : start + 60]
         if has_head:
-            _exec_git_raw(resolved_dir, ["reset", "-q", "HEAD", "--", *batch], timeout=10.0)
+            _exec_git_raw(resolved_dir, ["--literal-pathspecs", "reset", "-q", "HEAD", "--", *batch], timeout=10.0)
         else:
-            _exec_git_raw(resolved_dir, ["rm", "-r", "--cached", "-q", "--ignore-unmatch", "--", *batch], timeout=10.0)
+            _exec_git_raw(resolved_dir, ["--literal-pathspecs", "rm", "-r", "--cached", "-q", "--ignore-unmatch", "--", *batch], timeout=10.0)
+
+
+def _stage_checkpoint_paths(resolved_dir: Path, removed: list[str], tracked: list[str], new: list[str]) -> None:
+    env = _build_git_env(resolved_dir)
+    env["LC_ALL"] = "C"
+    for args, paths in (
+        (["rm", "-r", "--cached", "-q", "--ignore-unmatch"], removed),
+        (["add", "-u"], tracked),
+        (["add"], new),
+    ):
+        for start in range(0, len(paths), 60):
+            batch = paths[start : start + 60]
+            rc, _, error = _exec_git_raw(
+                resolved_dir, ["--literal-pathspecs", *args, "--", *batch], env=env, timeout=20.0,
+            )
+            if rc == 0:
+                continue
+            if args == ["add"] and "ignored by one of your .gitignore files" in error:
+                for path in _filter_out_git_ignored_paths(resolved_dir, batch):
+                    rc, _, error = _exec_git_raw(
+                        resolved_dir, ["--literal-pathspecs", "add", "--", path], env=env, timeout=20.0,
+                    )
+                    if rc and "ignored by one of your .gitignore files" not in error:
+                        raise GitServiceError(f"git add: {error.strip()}", status_code=500)
+                continue
+            raise GitServiceError(f"git {args[0]}: {error.strip()}", status_code=500)
 
 
 def create_project_checkpoint(
@@ -871,20 +950,26 @@ def create_project_checkpoint(
 
         entries = _parse_porcelain_z(raw_st)
         staged_blocked: list[str] = []
-        available_paths: list[str] = []
+        available_paths: dict[str, str] = {}
         rename_pairs: dict[str, str] = {}
+        untracked_candidates: list[str] = []
 
         for xy, rel_path, orig_path in entries:
-            if is_blocked_git_path(rel_path) or (orig_path and is_blocked_git_path(orig_path)):
+            if _is_excluded_git_path(resolved, rel_path) or (orig_path and _is_excluded_git_path(resolved, orig_path)):
                 if xy[0] not in (" ", "?", "!"):
                     staged_blocked.append(rel_path)
                     if orig_path:
                         staged_blocked.append(orig_path)
                 continue
-            if rel_path not in available_paths:
-                available_paths.append(rel_path)
+            if xy == "??":
+                untracked_candidates.append(rel_path)
+                continue
+            available_paths[rel_path] = xy
             if orig_path:
                 rename_pairs[rel_path] = orig_path
+
+        for rel_path in _filter_out_git_ignored_paths(resolved, untracked_candidates):
+            available_paths.setdefault(rel_path, "??")
 
         if staged_blocked:
             _unstage_paths(resolved, staged_blocked, has_head=bool(head_before))
@@ -918,39 +1003,45 @@ def create_project_checkpoint(
         if run_verify:
             _verify_project_files_syntax(resolved, selected_paths)
 
-        stage_targets: list[str] = []
-        for p in selected_paths:
-            if p not in stage_targets:
-                stage_targets.append(p)
-            orig = rename_pairs.get(p)
-            if orig and orig not in stage_targets and not is_blocked_git_path(orig):
-                stage_targets.append(orig)
+        stage_targets = set(selected_paths)
+        removed: list[str] = []
+        tracked: list[str] = []
+        new: list[str] = []
+        for path in selected_paths:
+            xy = available_paths[path]
+            if "D" in xy or not os.path.lexists(resolved / path):
+                removed.append(path)
+            elif xy == "??":
+                new.append(path)
+            else:
+                tracked.append(path)
+            orig = rename_pairs.get(path)
+            if orig:
+                stage_targets.add(orig)
+                if "R" in xy and not os.path.lexists(resolved / orig):
+                    removed.append(orig)
 
         # Reset index to HEAD first when explicit `paths` subset is requested so unrelated staged edits aren't swept in
         if paths is not None:
-            rc_idx, raw_idx, _ = _exec_git_bytes(resolved, ["diff", "--cached", "--name-only", "-z"], timeout=10.0)
+            rc_idx, raw_idx, _ = _exec_git_bytes(resolved, ["diff", "--cached", "--no-renames", "--name-only", "-z"], timeout=10.0)
             if rc_idx == 0 and raw_idx:
                 currently_staged = [normalize_rel_git_path(x.decode("utf-8", errors="replace")) for x in raw_idx.split(b"\x00") if x]
-                unrelated = [p for p in currently_staged if p and p not in set(stage_targets)]
+                unrelated = [p for p in currently_staged if p and p not in stage_targets]
                 _unstage_paths(resolved, unrelated, has_head=bool(head_before))
 
-        for start in range(0, len(stage_targets), 60):
-            batch = stage_targets[start : start + 60]
-            rc_add, _, err_add = _exec_git_raw(resolved, ["add", "-A", "--", *batch], timeout=20.0)
-            if rc_add != 0:
-                raise GitServiceError(f"Не удалось проиндексировать файлы проекта: {err_add.strip()}", status_code=500)
+        _stage_checkpoint_paths(resolved, list(dict.fromkeys(removed)), tracked, new)
 
-        rc_cached, raw_cached, _ = _exec_git_bytes(resolved, ["diff", "--cached", "--name-only", "-z"], timeout=10.0)
+        rc_cached, raw_cached, _ = _exec_git_bytes(resolved, ["diff", "--cached", "--no-renames", "--name-only", "-z"], timeout=10.0)
         staged_final = [
             normalize_rel_git_path(tok.decode("utf-8", errors="replace"))
             for tok in (raw_cached.split(b"\x00") if rc_cached == 0 and raw_cached else [])
             if tok
         ]
         # Hard invariant: never allow a blocked path in the commit index
-        leaked_blocked = [p for p in staged_final if is_blocked_git_path(p)]
+        leaked_blocked = [p for p in staged_final if _is_excluded_git_path(resolved, p)]
         if leaked_blocked:
             _unstage_paths(resolved, leaked_blocked, has_head=bool(head_before))
-            staged_final = [p for p in staged_final if not is_blocked_git_path(p)]
+            staged_final = [p for p in staged_final if p not in leaked_blocked]
 
         if not staged_final:
             return {
@@ -990,6 +1081,26 @@ def create_project_checkpoint(
         }
 
 
+def _checkpoint_restore_paths(resolved: Path, head_before: str, verified_target_sha: str) -> list[str]:
+    # Restore only tracked differences. A whole-tree restore can reach nested
+    # repositories or protected files even after they were excluded from stash.
+    rc_paths, raw_paths, err_paths = _exec_git_bytes(
+        resolved, ["diff", "--no-renames", "--name-only", "-z", head_before, verified_target_sha, "--"],
+        timeout=15.0,
+    )
+    if rc_paths != 0:
+        raise GitServiceError(f"git diff: {err_paths.strip()}", status_code=500)
+    restore_candidates = [
+        normalize_rel_git_path(path.decode("utf-8", errors="replace"))
+        for path in raw_paths.split(b"\x00") if path
+    ]
+    restore_paths = [path for path in restore_candidates
+                     if not _is_excluded_git_path(resolved, path) and not (resolved / path).is_dir()]
+    existing = [path for path in restore_paths if os.path.lexists(resolved / path)]
+    ignored = set(existing) - set(_filter_out_git_ignored_paths(resolved, existing))
+    return [path for path in restore_paths if path not in ignored]
+
+
 def rollback_project_to_checkpoint(
     proj_dir: Path,
     mode: str,
@@ -1023,28 +1134,39 @@ def rollback_project_to_checkpoint(
             )
 
         verified_target_sha = ""
+        restore_paths: list[str] = []
         if clean_mode == "restore_checkpoint":
             if not str(target_sha or "").strip():
                 raise GitServiceError("Не указан SHA целевой точки сохранения (target_sha)", status_code=400)
             verified_target_sha = _resolve_verified_commit_sha(resolved, target_sha)
+            restore_paths = _checkpoint_restore_paths(resolved, head_before, verified_target_sha)
 
         # Collect dirty non-blocked paths so `.env` / `*.db` / `*.session` stay untouched on disk
-        rc_st, raw_st, _ = _exec_git_bytes(resolved, ["status", "--porcelain=v1", "-z", "-uall"], timeout=15.0)
-        entries = _parse_porcelain_z(raw_st) if rc_st == 0 else []
+        rc_st, raw_st, err_st = _exec_git_bytes(resolved, ["status", "--porcelain=v1", "-z", "-uall"], timeout=15.0)
+        if rc_st != 0:
+            raise GitServiceError(f"git status: {err_st.strip()}", status_code=500)
+        entries = _parse_porcelain_z(raw_st)
         stashable_paths: list[str] = []
+        untracked_candidates: list[str] = []
         staged_blocked: list[str] = []
         for xy, rel_path, orig_path in entries:
-            if is_blocked_git_path(rel_path) or (orig_path and is_blocked_git_path(orig_path)):
+            if _is_excluded_git_path(resolved, rel_path) or (orig_path and _is_excluded_git_path(resolved, orig_path)):
                 if xy[0] not in (" ", "?", "!"):
                     staged_blocked.append(rel_path)
                     if orig_path:
                         staged_blocked.append(orig_path)
+                continue
+            if xy == "??":
+                untracked_candidates.append(rel_path)
                 continue
             if rel_path not in stashable_paths:
                 stashable_paths.append(rel_path)
             if orig_path and orig_path not in stashable_paths:
                 stashable_paths.append(orig_path)
 
+        stashable_paths = list(dict.fromkeys([
+            *stashable_paths, *_filter_out_git_ignored_paths(resolved, untracked_candidates),
+        ]))
         if staged_blocked:
             _unstage_paths(resolved, staged_blocked, has_head=True)
 
@@ -1057,7 +1179,7 @@ def rollback_project_to_checkpoint(
             stashes_before = _count_stashes(resolved)
             rc_sp, out_sp, err_sp = _exec_git_raw(
                 resolved,
-                ["stash", "push", "-u", "-m", stash_label, "--", *stashable_paths],
+                ["--literal-pathspecs", "stash", "push", "-u", "-m", stash_label, "--", *stashable_paths],
                 env=stash_env,
                 timeout=30.0,
             )
@@ -1080,37 +1202,16 @@ def rollback_project_to_checkpoint(
                 "stash_label": stash_label if backup_stash_created else "",
             }
 
-        # `mode == "restore_checkpoint"`: bring index + tracked worktree to exact `verified_target_sha`
-        # without rewriting branch history (`HEAD` stays at `head_before`), then create a new forward commit!
-        rc_res, _, err_res = _exec_git_raw(
-            resolved,
-            ["restore", f"--source={verified_target_sha}", "--staged", "--worktree", "--no-overlay", "--", "."],
-            timeout=30.0,
-        )
-        if rc_res != 0:
-            # Fallback for older Git binaries without `restore --no-overlay`
-            rc_rt, _, err_rt = _exec_git_raw(
+        for start in range(0, len(restore_paths), 60):
+            batch = restore_paths[start : start + 60]
+            rc_res, _, err_res = _exec_git_raw(
                 resolved,
-                ["read-tree", "--reset", "-u", verified_target_sha],
+                ["--literal-pathspecs", "restore", f"--source={verified_target_sha}",
+                 "--staged", "--worktree", "--no-overlay", "--", *batch],
                 timeout=30.0,
             )
-            if rc_rt != 0:
-                raise GitServiceError(
-                    f"Не удалось восстановить дерево файлов из точки {verified_target_sha[:7]}: {err_rt.strip() or err_res.strip()}",
-                    status_code=500,
-                )
-
-        # Ensure no blocked paths were ever present in old commit index
-        rc_c, raw_c, _ = _exec_git_bytes(resolved, ["diff", "--cached", "--name-only", "-z"], timeout=10.0)
-        if rc_c == 0 and raw_c:
-            staged_after_restore = [
-                normalize_rel_git_path(x.decode("utf-8", errors="replace"))
-                for x in raw_c.split(b"\x00")
-                if x
-            ]
-            blocked_restored = [p for p in staged_after_restore if is_blocked_git_path(p)]
-            if blocked_restored:
-                _unstage_paths(resolved, blocked_restored, has_head=True)
+            if rc_res != 0:
+                raise GitServiceError(f"git restore: {err_res.strip()}", status_code=500)
 
         rc_diff_idx, _, _ = _exec_git_raw(resolved, ["diff", "--cached", "--quiet"], timeout=10.0)
         if rc_diff_idx == 0:

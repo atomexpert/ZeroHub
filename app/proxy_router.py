@@ -1701,6 +1701,16 @@ def _spawn_xray_tunnel_sync(parsed: ParsedProxySpec) -> _ManagedTunnel:
             proc.kill()
         except Exception:
             pass
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            pass
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except Exception:
+                    pass
         raise ProxyRouteError(f"Не удалось передать конфигурацию в stdin Xray-core: {exc}") from exc
 
     deadline = time.monotonic() + 3.5
@@ -1722,7 +1732,7 @@ def _spawn_xray_tunnel_sync(parsed: ParsedProxySpec) -> _ManagedTunnel:
                     proc.wait(timeout=1.0)
                 except Exception:
                     proc.kill()
-                    proc.wait(timeout=1.0)
+                    proc.wait(timeout=2.0)
             for th in drain_threads:
                 th.join(timeout=1.0)
             err_b = b"".join(list(err_tail))
@@ -1732,6 +1742,13 @@ def _spawn_xray_tunnel_sync(parsed: ParsedProxySpec) -> _ManagedTunnel:
             err_detail = raw_msg[-260:] if raw_msg else ""
         except Exception:
             err_detail = ""
+        finally:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except Exception:
+                        pass
         suffix = f": {err_detail}" if err_detail else " (таймаут открытия локального порта)"
         raise ProxyRouteError(f"Туннель Xray ({parsed.safe_label}) не смог запуститься{suffix}")
 

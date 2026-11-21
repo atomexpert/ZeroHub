@@ -13,14 +13,45 @@ Provides:
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import os
 import re
 import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from fastapi import HTTPException
+
 from . import config, gdrive_service, workspace_mcp
+
+_ENV_PATH_LOCKS_GUARD = threading.Lock()
+_ENV_PATH_LOCKS: dict[str, threading.Lock] = {}
+
+
+class EnvConflictError(HTTPException):
+    """Raised when optimistic SHA-256 concurrency check fails while saving a `.env` file."""
+
+    def __init__(
+        self,
+        detail: str = "Файл .env был изменён на диске (конфликт версий). Обновите файл перед сохранением.",
+    ) -> None:
+        super().__init__(status_code=409, detail=detail)
+
+
+def _get_env_path_lock(target: Path) -> threading.Lock:
+    canon = os.path.normcase(str(target.resolve(strict=False)))
+    with _ENV_PATH_LOCKS_GUARD:
+        lock = _ENV_PATH_LOCKS.get(canon)
+        if lock is None:
+            if len(_ENV_PATH_LOCKS) > 512:
+                for key, existing_lock in list(_ENV_PATH_LOCKS.items()):
+                    if not existing_lock.locked():
+                        _ENV_PATH_LOCKS.pop(key, None)
+            lock = threading.Lock()
+            _ENV_PATH_LOCKS[canon] = lock
+        return lock
 
 MAX_ENV_FILE_BYTES = 262_144  # 256 KiB
 MAX_ENV_DISCOVERY_DEPTH = 2
@@ -1010,46 +1041,61 @@ def save_project_env_file(
     entries: Optional[list[dict[str, Any]]] = None,
     raw_content: Optional[str] = None,
     ensure_gitignore: bool = True,
+    expected_sha256: Optional[str] = None,
 ) -> dict[str, Any]:
     """Atomically save a project's `.env` file in `entries` or `raw` mode with safety guards."""
     root = Path(proj_dir).resolve(strict=False)
     target, norm_file = resolve_safe_env_target(root, rel_file or ".env", allow_example=False)
 
-    existing_text = (
-        target.read_text(encoding="utf-8", errors="replace").lstrip("\ufeff")
-        if target.is_file()
-        else ""
-    )
+    path_lock = _get_env_path_lock(target)
+    with path_lock:
+        raw_existing_bytes = target.read_bytes() if target.is_file() else b""
+        current_sha256 = hashlib.sha256(raw_existing_bytes).hexdigest()
+        if expected_sha256 is not None:
+            clean_expected = str(expected_sha256).strip().lower()
+            if clean_expected and clean_expected != current_sha256:
+                raise EnvConflictError(
+                    "Файл .env был изменён на диске (конфликт версий SHA-256). "
+                    "Обновите файл и повторите сохранение."
+                )
 
-    if mode == "entries":
-        if entries is None:
-            raise ValueError("Список записей `entries` обязателен для табличного режима.")
-        new_text = apply_entries_to_dotenv(existing_text, entries)
-    elif mode == "raw":
-        if raw_content is None:
-            raise ValueError("Поле `raw_content` обязательно для текстового режима.")
-        if "\x00" in raw_content:
-            raise ValueError("Содержимое .env не может содержать нулевые байты (NUL).")
-        new_text = raw_content.lstrip("\ufeff")
-        if len(new_text.encode("utf-8")) > MAX_ENV_FILE_BYTES:
-            raise ValueError(
-                f"Размер файла превышает допустимый лимит {MAX_ENV_FILE_BYTES // 1024} КБ."
-            )
-    else:
-        raise ValueError(f"Неподдерживаемый режим сохранения: {mode}")
+        existing_text = (
+            raw_existing_bytes.decode("utf-8", errors="replace").lstrip("\ufeff")
+            if raw_existing_bytes
+            else ""
+        )
 
-    _enforce_self_hub_protected_keys(root, existing_text, new_text)
-    _atomic_write_text_utf8(target, new_text, max_bytes=MAX_ENV_FILE_BYTES)
+        if mode == "entries":
+            if entries is None:
+                raise ValueError("Список записей `entries` обязателен для табличного режима.")
+            new_text = apply_entries_to_dotenv(existing_text, entries)
+        elif mode == "raw":
+            if raw_content is None:
+                raise ValueError("Поле `raw_content` обязательно для текстового режима.")
+            if "\x00" in raw_content:
+                raise ValueError("Содержимое .env не может содержать нулевые байты (NUL).")
+            new_text = raw_content.lstrip("\ufeff")
+            if len(new_text.encode("utf-8")) > MAX_ENV_FILE_BYTES:
+                raise ValueError(
+                    f"Размер файла превышает допустимый лимит {MAX_ENV_FILE_BYTES // 1024} КБ."
+                )
+        else:
+            raise ValueError(f"Неподдерживаемый режим сохранения: {mode}")
+
+        _enforce_self_hub_protected_keys(root, existing_text, new_text)
+        _atomic_write_text_utf8(target, new_text, max_bytes=MAX_ENV_FILE_BYTES)
 
     gitignore_updated = False
     if ensure_gitignore:
         gitignore_updated = ensure_env_in_gitignore(root, norm_file)
 
+    written_bytes = new_text.encode("utf-8")
     return {
         "ok": True,
         "active_file": norm_file,
         "gitignore_updated": gitignore_updated,
-        "bytes_written": len(new_text.encode("utf-8")),
+        "bytes_written": len(written_bytes),
+        "sha256": hashlib.sha256(written_bytes).hexdigest(),
     }
 
 

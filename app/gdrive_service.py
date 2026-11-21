@@ -21,11 +21,13 @@ import gzip
 import hashlib
 import html
 import inspect
+import io
 import json
 import mimetypes
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -420,11 +422,14 @@ def urllib_proxy_transport(
             return HttpResponse(status=status, headers=resp_headers, body=resp.read())
     except urllib.error.HTTPError as exc:
         try:
-            err_body = exc.read()
-        except Exception:
-            err_body = b""
-        resp_headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
-        return HttpResponse(status=int(exc.code), headers=resp_headers, body=err_body)
+            try:
+                err_body = exc.read()
+            except Exception:
+                err_body = b""
+            resp_headers = {k.lower(): v for k, v in (exc.headers.items() if exc.headers else [])}
+            return HttpResponse(status=int(exc.code), headers=resp_headers, body=err_body)
+        finally:
+            exc.close()
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         raise GDriveServiceError(
             f"Сетевая ошибка при обращении к Google API: {exc}",
@@ -1756,18 +1761,18 @@ def build_sanitized_sqlite_gz_with_stats(
         src_conn: Optional[sqlite3.Connection] = None
         dst_conn: Optional[sqlite3.Connection] = None
         try:
-            src_conn = sqlite3.connect(src_uri, uri=True, timeout=15.0)
-            dst_conn = sqlite3.connect(str(tmp_db), timeout=15.0)
-            src_conn.backup(dst_conn)
-        finally:
-            if src_conn is not None:
-                try:
-                    src_conn.close()
-                except Exception:
-                    pass
+            try:
+                src_conn = sqlite3.connect(src_uri, uri=True, timeout=30.0)
+                dst_conn = sqlite3.connect(str(tmp_db), timeout=30.0)
+                src_conn.backup(dst_conn, pages=250, sleep=0.02)
+            finally:
+                if src_conn is not None:
+                    try:
+                        src_conn.close()
+                    except Exception:
+                        pass
 
-        assert dst_conn is not None
-        try:
+            assert dst_conn is not None
             dst_conn.execute("PRAGMA foreign_keys = OFF;")
             # Drop views and triggers that might reference dropped auth/token tables
             for obj_type, obj_name in dst_conn.execute(
@@ -1847,10 +1852,17 @@ def build_sanitized_sqlite_gz_with_stats(
             dst_conn.execute("VACUUM;")
             dst_conn.commit()
         finally:
-            dst_conn.close()
+            if dst_conn is not None:
+                try:
+                    dst_conn.close()
+                except Exception:
+                    pass
 
-        raw_sqlite = tmp_db.read_bytes()
-    return gzip.compress(raw_sqlite, compresslevel=6, mtime=0), stats
+        buf = io.BytesIO()
+        with tmp_db.open("rb") as src_fh:
+            with gzip.GzipFile(filename="", mode="wb", compresslevel=6, fileobj=buf, mtime=0) as gz_fh:
+                shutil.copyfileobj(src_fh, gz_fh, length=1024 * 1024)
+    return buf.getvalue(), stats
 
 
 def build_sanitized_sqlite_gz(source_db_path: Optional[Path] = None) -> bytes:
@@ -4311,7 +4323,7 @@ async def execute_gdrive_restore(
                     if _is_safe_path_within_root(target_dir, safe_rel) is None:
                         blocked_paths.append(f"{valid_proj}/{raw_rel}")
                         continue
-                    dest.write_bytes(file_bytes)
+                    config.atomic_write_bytes(dest, file_bytes)
                     if existed:
                         code_report["files_overwritten"] += 1
                     else:
@@ -4399,7 +4411,7 @@ async def execute_gdrive_restore(
                 if _is_safe_path_within_root(target_dir, safe_rel) is None:
                     blocked_paths.append(f"vault:{valid_proj}/{raw_rel}")
                     continue
-                dest.write_bytes(raw_bytes)
+                config.atomic_write_bytes(dest, raw_bytes)
                 vault_report["files_restored"] += 1
 
         await asyncio.to_thread(_restore_vault_sync)

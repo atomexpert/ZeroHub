@@ -1947,8 +1947,9 @@ async def _terminate_hung_cli_proc(proc: asyncio.subprocess.Process) -> None:
             except Exception:
                 pass
             if not waited_ok and os.name == "nt" and pid:
+                tk_ok = False
                 try:
-                    await asyncio.to_thread(
+                    tk_res = await asyncio.to_thread(
                         subprocess.run,
                         ["taskkill", "/F", "/T", "/PID", str(pid)],
                         stdin=subprocess.DEVNULL,
@@ -1957,6 +1958,16 @@ async def _terminate_hung_cli_proc(proc: asyncio.subprocess.Process) -> None:
                         timeout=2.5,
                         **subprocess_hidden_kwargs(),
                     )
+                    tk_ok = tk_res.returncode == 0
+                except Exception:
+                    tk_ok = False
+                if not tk_ok and proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=2.0)
                 except Exception:
                     pass
     finally:
@@ -2040,20 +2051,29 @@ async def cancel_chat_generation(chat_id: str) -> bool:
     if proc and proc.returncode is None:
         pid = proc.pid
         if os.name == "nt" and pid:
+            tk_ok = False
             try:
-                await asyncio.to_thread(
+                tk_res = await asyncio.to_thread(
                     subprocess.run,
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                     timeout=3.0,
                     **subprocess_hidden_kwargs(),
                 )
+                tk_ok = tk_res.returncode == 0
             except Exception:
+                tk_ok = False
+            if not tk_ok and proc.returncode is None:
                 try:
                     proc.kill()
                 except Exception:
                     pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
         elif pid:
             try:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
@@ -2062,6 +2082,18 @@ async def cancel_chat_generation(chat_id: str) -> bool:
                     proc.terminate()
                 except Exception:
                     pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                if proc.returncode is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=1.0)
+                    except Exception:
+                        pass
     return True
 
 
@@ -3563,6 +3595,18 @@ SINGLE_TAB_SANDBOX_FILES_INSTRUCTION = (
 )
 
 
+HUB_FILE_DELIVERY_INSTRUCTION = (
+    "При обычном упоминании файла проекта используй строчную ссылку "
+    "[ИмяФайла.ext](file:///полный/путь/ИмяФайла.ext) без восклицательного знака: "
+    "ZeroHub позволяет скачать файл по ссылке с телефона и ПК без VPN. "
+    "Карточку ![Краткая подпись](file:///полный/путь/ИмяФайла.ext) вставляй только по просьбе прислать "
+    "файл для скачивания в чате или при сдаче запрошенной сборки, архива или документа. "
+    "Прикладывай ровно одну карточку целевого файла без дублей из build/ или target/ "
+    "и без попутных бинарников других платформ. "
+    "Не пиши «я не могу прикрепить бинарный файл в чат» и не выдумывай «панель файлов Hub».\n"
+)
+
+
 def _build_docker_unavailable_instruction(reason: str = "") -> str:
     clean_reason = (
         reason or "Docker Desktop не запущен или образ песочницы `agy-hub-sandbox:latest` ещё не собран"
@@ -3680,6 +3724,7 @@ def _augment_prompt_for_mode(
             parts.append(SINGLE_TAB_HOST_FULL_EXECUTION_INSTRUCTION)
         else:
             parts.append(SINGLE_TAB_EXECUTION_INSTRUCTION)
+        parts.append(HUB_FILE_DELIVERY_INSTRUCTION)
     if not live_voice and kind == "project" and access_mode in ("write_files", "full_access"):
         default_guardrails = config.get_default_project_guardrails_block(
             project_dir,
@@ -3709,7 +3754,7 @@ def _augment_prompt_for_mode(
             )
             parts.append(ref_intro + "\n\n".join(clean_refs) + "\n")
     if attachments:
-        att_lines = ["Прикреплённые пользователем файлы (прочитай/просмотри их через read_file):"]
+        att_lines = ["Прикреплённые пользователем файлы (прочитай/просмотри их через read_file; не дублируй картинки и file://-ссылки на эти временные вложения в своём ответе):"]
         for att in attachments:
             if att.get("disk_path"):
                 att_lines.append(f"- {att['disk_path']} ({att.get('name', 'file')})")
@@ -6034,7 +6079,8 @@ async def stream_agy_turn(
             await cancel_chat_sandbox_execs(chat_id)
         except Exception:
             pass
-        ACTIVE_RUNS.pop(chat_id, None)
+        if ACTIVE_RUNS.get(chat_id) is run_state:
+            ACTIVE_RUNS.pop(chat_id, None)
         if 'proc' in locals() and hasattr(proc, 'aclose_lease'):
             await proc.aclose_lease()
         for tmp_pf in created_large_prompt_files:

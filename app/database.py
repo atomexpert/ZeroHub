@@ -17,6 +17,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 import weakref
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -56,15 +57,12 @@ from .config import (
 PBKDF2_ITERATIONS = 210_000
 PROXY_PBKDF2_ITERATIONS = 200_000
 
-_PROXY_FERNET_LOCK = threading.Lock()
 
-
-@functools.lru_cache(maxsize=64)
+@functools.lru_cache(maxsize=256)
 def _pbkdf2_fernet_cached(secret: str, salt: bytes, iterations: int) -> Fernet:
     """v110: LRU-кэш PBKDF2-HMAC-SHA256 (120k–200k итераций) — без повторной блокировки Event Loop."""
     raw_key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, iterations, dklen=32)
     return Fernet(base64.urlsafe_b64encode(raw_key))
-_PROXY_FERNET_CACHE: dict[tuple[str, str], Fernet] = {}
 
 
 def _derive_proxy_fernet(scope_id: str) -> Fernet:
@@ -73,25 +71,8 @@ def _derive_proxy_fernet(scope_id: str) -> Fernet:
     if not clean_scope:
         raise ValueError("Не указан идентификатор домена шифрования прокси")
     secret = get_or_create_hub_secret()
-    cache_key = (secret, clean_scope)
-    with _PROXY_FERNET_LOCK:
-        cached = _PROXY_FERNET_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
     salt = b"agy-hub-proxy-v1:" + clean_scope.encode("utf-8")
-    raw_key = hashlib.pbkdf2_hmac(
-        "sha256",
-        secret.encode("utf-8"),
-        salt,
-        PROXY_PBKDF2_ITERATIONS,
-        dklen=32,
-    )
-    fernet = Fernet(base64.urlsafe_b64encode(raw_key))
-    with _PROXY_FERNET_LOCK:
-        if len(_PROXY_FERNET_CACHE) > 512:
-            _PROXY_FERNET_CACHE.clear()
-        _PROXY_FERNET_CACHE[cache_key] = fernet
-    return fernet
+    return _pbkdf2_fernet_cached(secret, salt, PROXY_PBKDF2_ITERATIONS)
 
 
 def encrypt_scoped_proxy_spec(scope_id: str, raw_spec: str) -> str:
@@ -889,9 +870,17 @@ async def connect_db():
                     break
                 _all_conns.discard(cand)
             if conn is None:
-                conn = await _open_pooled_conn(path)
-                _conn_generation[conn] = _pool_generation
-                _all_conns.add(conn)
+                gen = _pool_generation
+                cand = await _open_pooled_conn(path)
+                if _pool_generation != gen:
+                    await _safe_close_conn(cand)
+                    path = _resolved_db_path()
+                    gen = _pool_generation
+                    cand = await _open_pooled_conn(path)
+                conn = cand
+                _conn_generation[conn] = gen
+                if _pool_generation == gen:
+                    _all_conns.add(conn)
         else:
             conn = await _open_pooled_conn(path)
             _conn_generation[conn] = -1
@@ -999,6 +988,7 @@ async def init_db() -> None:
                 allowed_models_json TEXT NOT NULL DEFAULT '[]',
                 projects_order_json TEXT NOT NULL DEFAULT '[]',
                 advisor_prefs_json TEXT NOT NULL DEFAULT '{}',
+                notification_prefs_json TEXT NOT NULL DEFAULT '{}',
                 daily_token_limit INTEGER NOT NULL DEFAULT 0,
                 quota_reserve_pct INTEGER NOT NULL DEFAULT 15,
                 custom_rules TEXT NOT NULL DEFAULT '',
@@ -1219,6 +1209,22 @@ async def init_db() -> None:
                 updated_at TEXT NOT NULL DEFAULT ''
             );
 
+            CREATE TABLE IF NOT EXISTS push_subscriptions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                endpoint TEXT NOT NULL UNIQUE,
+                p256dh TEXT NOT NULL,
+                auth TEXT NOT NULL,
+                device_label TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                last_error TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user
+                ON push_subscriptions(user_id, last_seen_at DESC);
+
             CREATE TABLE IF NOT EXISTS gdrive_configs (
                 user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
                 oauth_client_encrypted TEXT NOT NULL DEFAULT '',
@@ -1298,6 +1304,8 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE chats ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0;")
         if "archived_at" not in existing_cols:
             await db.execute("ALTER TABLE chats ADD COLUMN archived_at TEXT NOT NULL DEFAULT '';")
+        if "source_desktop_id" not in existing_cols:
+            await db.execute("ALTER TABLE chats ADD COLUMN source_desktop_id TEXT NOT NULL DEFAULT '';")
 
         cur_m = await db.execute("PRAGMA table_info(messages);")
         msg_cols = {row[1] for row in await cur_m.fetchall()}
@@ -1350,6 +1358,17 @@ async def init_db() -> None:
         await db.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_bookmarked ON messages(chat_id) WHERE bookmarked = 1;"
         )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chats_kind_proj_nocase ON chats(kind, LOWER(project_name));"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chats_source_desktop "
+            "ON chats(source_desktop_id) WHERE source_desktop_id != '';"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chats_agy_conv "
+            "ON chats(agy_conversation_id) WHERE agy_conversation_id != '';"
+        )
 
         cur_u_cols = await db.execute("PRAGMA table_info(users);")
         user_cols = {row[1] for row in await cur_u_cols.fetchall()}
@@ -1361,6 +1380,7 @@ async def init_db() -> None:
             await db.execute("ALTER TABLE users ADD COLUMN sandbox_network TEXT NOT NULL DEFAULT 'internet';")
         if "projects_order_json" not in user_cols:
             await db.execute("ALTER TABLE users ADD COLUMN projects_order_json TEXT NOT NULL DEFAULT '[]';")
+        await _ensure_notification_prefs_column(db, user_cols)
         if "advisor_prefs_json" not in user_cols:
             await db.execute("ALTER TABLE users ADD COLUMN advisor_prefs_json TEXT NOT NULL DEFAULT '{}';")
         await db.execute(
@@ -1770,6 +1790,31 @@ def _normalize_sandbox_network(val: Any) -> str:
     return clean if clean in VALID_SANDBOX_NETWORK_MODES else "internet"
 
 
+_NOTIFICATION_PREF_DEFAULTS = {
+    "in_app_toast": True,
+    "system_push": True,
+    "sound": False,
+    "on_turn_done": True,
+    "on_turn_error": True,
+    "on_process_crash": True,
+    "only_long_turns": False,
+}
+
+
+def normalize_notification_prefs(raw: Any) -> dict[str, bool]:
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raw = {}
+    if not isinstance(raw, dict):
+        raw = {}
+    return {
+        key: raw[key] if isinstance(raw.get(key), bool) else default
+        for key, default in _NOTIFICATION_PREF_DEFAULTS.items()
+    }
+
+
 def _row_to_user(row: aiosqlite.Row, *, include_secret: bool = False) -> dict[str, Any]:
     d = dict(row)
     d["is_active"] = bool(d.get("is_active", 1))
@@ -1782,6 +1827,7 @@ def _row_to_user(row: aiosqlite.Row, *, include_secret: bool = False) -> dict[st
     d.pop("projects_order_json", None)
     raw_advisor = d.pop("advisor_prefs_json", "{}")
     d["advisor_prefs"] = normalize_advisor_prefs(raw_advisor)
+    d["notification_prefs"] = normalize_notification_prefs(d.pop("notification_prefs_json", "{}"))
     raw_models = d.pop("allowed_models_json", "[]")
     try:
         parsed = json.loads(raw_models) if raw_models else []
@@ -1793,9 +1839,6 @@ def _row_to_user(row: aiosqlite.Row, *, include_secret: bool = False) -> dict[st
     return d
 
 
-_row_to_user_dict = _row_to_user
-
-
 _USER_BY_ID_CACHE_TTL_SEC = 15.0
 _USER_BY_ID_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _USER_CACHE_EPOCH = 0
@@ -1805,8 +1848,9 @@ def _copy_user_dict(user: dict[str, Any]) -> dict[str, Any]:
     out = dict(user)
     if isinstance(out.get("allowed_models"), list):
         out["allowed_models"] = list(out["allowed_models"])
-    if isinstance(out.get("advisor_prefs"), dict):
-        out["advisor_prefs"] = dict(out["advisor_prefs"])
+    for key in ("advisor_prefs", "notification_prefs"):
+        if isinstance(out.get(key), dict):
+            out[key] = dict(out[key])
     return out
 
 
@@ -1936,7 +1980,6 @@ async def get_user_projects_order(user_id: str) -> list[str]:
     if not clean_uid:
         return []
     async with connect_db() as db:
-        await _ensure_projects_order_column(db)
         cur = await db.execute(
             "SELECT projects_order_json FROM users WHERE id = ? LIMIT 1",
             (clean_uid,),
@@ -1958,7 +2001,6 @@ async def set_user_projects_order(user_id: str, project_names: list[str]) -> lis
         return clean_order
     now = utc_now_iso()
     async with connect_db() as db:
-        await _ensure_projects_order_column(db)
         await db.execute(
             "UPDATE users SET projects_order_json = ?, updated_at = ? WHERE id = ?",
             (json.dumps(clean_order, ensure_ascii=False), now, clean_uid),
@@ -2212,7 +2254,6 @@ async def update_user_advisor_prefs(
     now = utc_now_iso()
     async with connect_db() as db:
         db.row_factory = aiosqlite.Row
-        await _ensure_advisor_prefs_column(db)
         cur = await db.execute(
             "SELECT advisor_prefs_json FROM users WHERE id = ? LIMIT 1",
             (clean_uid,),
@@ -2233,6 +2274,107 @@ async def update_user_advisor_prefs(
         await db.commit()
         invalidate_user_cache(clean_uid)
     return saved
+
+
+async def _ensure_notification_prefs_column(db: aiosqlite.Connection, user_cols: set[str]) -> None:
+    if "notification_prefs_json" not in user_cols:
+        await db.execute("ALTER TABLE users ADD COLUMN notification_prefs_json TEXT NOT NULL DEFAULT '{}';")
+
+
+async def update_user_notification_prefs(user_id: str, patch: dict[str, Any]) -> dict[str, bool]:
+    async with connect_db() as db:
+        await db.execute("BEGIN IMMEDIATE")
+        async with db.execute("SELECT notification_prefs_json FROM users WHERE id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        if row is None:
+            raise LookupError("Пользователь не найден")
+        saved = normalize_notification_prefs(row[0])
+        saved.update({key: value for key, value in patch.items() if key in saved and isinstance(value, bool)})
+        await db.execute(
+            "UPDATE users SET notification_prefs_json = ?, updated_at = ? WHERE id = ?",
+            (json.dumps(saved), utc_now_iso(), user_id),
+        )
+        await db.commit()
+    invalidate_user_cache(user_id)
+    return saved
+
+
+async def upsert_push_subscription(
+    user_id: str, endpoint: str, p256dh: str, auth: str, device_label: str, user_agent: str
+) -> str:
+    # A fresh ID prevents an in-flight response from expiring a renewed subscription.
+    sub_id = uuid.uuid4().hex
+    now = utc_now_iso()
+    async with connect_db() as db:
+        await db.execute(
+            """
+            INSERT INTO push_subscriptions
+                (id, user_id, endpoint, p256dh, auth, device_label, user_agent, created_at, last_seen_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(endpoint) DO UPDATE SET
+                id = excluded.id, user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth,
+                device_label = excluded.device_label, user_agent = excluded.user_agent,
+                last_seen_at = excluded.last_seen_at, last_error = '',
+                created_at = CASE WHEN user_id = excluded.user_id THEN created_at ELSE excluded.created_at END
+            WHERE user_id = excluded.user_id OR (p256dh = excluded.p256dh AND auth = excluded.auth)
+            """,
+            (sub_id, user_id, endpoint, p256dh, auth, device_label, user_agent, now, now),
+        )
+        async with db.execute("SELECT id FROM push_subscriptions WHERE endpoint = ?", (endpoint,)) as cur:
+            if (await cur.fetchone())[0] != sub_id:
+                raise ValueError("Эта подписка уже привязана к другому устройству")
+        await db.execute(
+            """DELETE FROM push_subscriptions WHERE id IN (
+                SELECT id FROM push_subscriptions WHERE user_id = ?
+                ORDER BY last_seen_at DESC, rowid DESC LIMIT -1 OFFSET 12
+            )""",
+            (user_id,),
+        )
+        await db.commit()
+    return sub_id
+
+
+async def list_user_push_subscriptions(user_id: str, include_secrets: bool = False) -> list[dict[str, Any]]:
+    async with connect_db() as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM push_subscriptions WHERE user_id = ? ORDER BY last_seen_at DESC, rowid DESC",
+            (user_id,),
+        ) as cur:
+            subscriptions = [dict(row) for row in await cur.fetchall()]
+    if not include_secrets:
+        for item in subscriptions:
+            endpoint = item["endpoint"]
+            item["endpoint"] = f"{urlsplit(endpoint).hostname}/…{endpoint[-6:]}"
+            item["endpoint_fingerprint"] = hashlib.sha256(endpoint.encode()).hexdigest()
+            for key in ("p256dh", "auth", "user_id"):
+                item.pop(key)
+    return subscriptions
+
+
+async def delete_push_subscription(user_id: str, *, sub_id: str = "", endpoint: str = "") -> bool:
+    if not (sub_id or endpoint):
+        return False
+    column, value = ("id", sub_id) if sub_id else ("endpoint", endpoint)
+    async with connect_db() as db:
+        cursor = await db.execute(f"DELETE FROM push_subscriptions WHERE user_id = ? AND {column} = ?", (user_id, value))
+        await db.commit()
+        return cursor.rowcount > 0
+
+
+async def delete_expired_push_endpoint(endpoint: str, *, sub_id: str = "") -> None:
+    async with connect_db() as db:
+        await db.execute(
+            "DELETE FROM push_subscriptions WHERE endpoint = ? AND (? = '' OR id = ?)",
+            (endpoint, sub_id, sub_id),
+        )
+        await db.commit()
+
+
+async def record_push_subscription_result(sub_id: str, error_text: str = "") -> None:
+    async with connect_db() as db:
+        await db.execute("UPDATE push_subscriptions SET last_error = ? WHERE id = ?", (error_text[:200], sub_id))
+        await db.commit()
 
 
 async def delete_user(user_id: str) -> bool:
@@ -3288,11 +3430,11 @@ async def reorder_chats(chat_ids: list[str], *, owner_id: Optional[str] = None) 
 
 async def delete_chat(chat_id: str) -> bool:
     async with connect_db() as db:
-        await db.execute("PRAGMA foreign_keys=ON;")
         cur = await db.execute("DELETE FROM chats WHERE id = ?", (chat_id,))
         await db.commit()
         invalidate_chat_list_cache(chat_id)
-        _reset_usage_ledger_cache()
+        _USAGE_LEDGER_CACHE.setdefault("evicted_chats", set()).add(str(chat_id))
+        _bump_usage_ledger_version()
         return cur.rowcount > 0
 
 
@@ -3343,6 +3485,125 @@ async def get_messages(chat_id: str, include_thinking: bool = True) -> list[dict
             )
         rows = await cur.fetchall()
         return [_row_to_message(r) for r in rows]
+
+
+async def get_continue_turn_messages(
+    chat_id: str,
+) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]]]:
+    """Targeted lookup for `continue_turn`: last non-system message and last preceding user message."""
+    async with connect_db() as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT
+                m.id,
+                m.chat_id,
+                m.user_id,
+                m.role,
+                m.content,
+                CASE WHEN m.status = 'streaming' THEN m.thinking ELSE '' END AS thinking,
+                CASE WHEN TRIM(COALESCE(m.thinking, '')) != '' THEN 1 ELSE 0 END AS has_thinking,
+                m.tool_calls_json,
+                m.attachments_json,
+                m.model,
+                m.usage_json,
+                m.status,
+                m.bookmarked,
+                m.custom_title,
+                m.auto_title,
+                m.created_at,
+                COALESCE(u.display_name, u.username, '') AS author_name
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.user_id
+            WHERE m.chat_id = ? AND m.role != 'system'
+            ORDER BY m.id DESC
+            LIMIT 1
+            """,
+            (chat_id,),
+        )
+        target_row = await cur.fetchone()
+        if not target_row:
+            return None, None
+        target_msg = _row_to_message(target_row)
+        cur_u = await db.execute(
+            """
+            SELECT
+                m.id,
+                m.chat_id,
+                m.user_id,
+                m.role,
+                m.content,
+                '' AS thinking,
+                CASE WHEN TRIM(COALESCE(m.thinking, '')) != '' THEN 1 ELSE 0 END AS has_thinking,
+                m.tool_calls_json,
+                m.attachments_json,
+                m.model,
+                m.usage_json,
+                m.status,
+                m.bookmarked,
+                m.custom_title,
+                m.auto_title,
+                m.created_at,
+                COALESCE(u.display_name, u.username, '') AS author_name
+            FROM messages m
+            LEFT JOIN users u ON u.id = m.user_id
+            WHERE m.chat_id = ? AND m.role = 'user' AND m.id < ?
+            ORDER BY m.id DESC
+            LIMIT 1
+            """,
+            (chat_id, int(target_msg["id"])),
+        )
+        user_row = await cur_u.fetchone()
+        return target_msg, (_row_to_message(user_row) if user_row else None)
+
+
+async def checkpoint_streaming_message(
+    message_id: int,
+    *,
+    content: str,
+    thinking: str,
+    tool_calls: Optional[list[dict[str, Any]]] = None,
+) -> bool:
+    """Persist intermediate streaming progress without bumping `_USAGE_LEDGER_VERSION`."""
+    tc_json = json.dumps(compact_tool_calls_payload(tool_calls or []), ensure_ascii=False)
+    async with connect_db() as db:
+        cur = await db.execute(
+            """
+            UPDATE messages
+            SET content = ?, thinking = ?, tool_calls_json = ?
+            WHERE id = ? AND status = 'streaming'
+            """,
+            (content, thinking, tc_json, int(message_id)),
+        )
+        await db.commit()
+        return bool(cur.rowcount and cur.rowcount > 0)
+
+
+async def checkpoint_chat_streaming_message(
+    chat_id: str,
+    *,
+    content: str,
+    thinking: str,
+    tool_calls: Optional[list[dict[str, Any]]] = None,
+) -> bool:
+    """Persist interrupted snapshot of a chat's active `streaming` message during shutdown."""
+    tc_json = json.dumps(compact_tool_calls_payload(tool_calls or []), ensure_ascii=False)
+    async with connect_db() as db:
+        cur = await db.execute(
+            """
+            UPDATE messages
+            SET content = ?, thinking = ?, tool_calls_json = ?
+            WHERE id = (
+                SELECT id FROM messages
+                WHERE chat_id = ? AND status = 'streaming'
+                ORDER BY id DESC
+                LIMIT 1
+            )
+            """,
+            (content, thinking, tc_json, str(chat_id)),
+        )
+        await db.commit()
+        return bool(cur.rowcount and cur.rowcount > 0)
 
 
 async def get_message_thinking(chat_id: str, message_id: int) -> Optional[dict[str, Any]]:
@@ -3408,7 +3669,6 @@ async def add_message(
     clean_auto_title = re.sub(r"\s+", " ", str(auto_title or "")).strip()[:140].rstrip()
     async with connect_db() as db:
         db.row_factory = aiosqlite.Row
-        await db.execute("PRAGMA foreign_keys=ON;")
         cur = await db.execute(
             """
             INSERT INTO messages (
@@ -3484,7 +3744,6 @@ async def add_messages_bulk(
         for m in messages
     ]
     async with connect_db() as db:
-        await db.execute("PRAGMA foreign_keys=ON;")
         await db.executemany(
             """
             INSERT INTO messages (
@@ -3754,82 +4013,88 @@ async def append_message_code_handoff(
         return None
     async with connect_db() as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT usage_json FROM messages WHERE id = ? AND chat_id = ?",
-            (int(message_id), clean_chat_id),
-        )
-        row = await cur.fetchone()
-        if not row:
-            return None
-
-        raw_usage = row["usage_json"] or ""
+        await db.execute("BEGIN IMMEDIATE")
         try:
-            usage = json.loads(raw_usage) if raw_usage else {}
-        except Exception:
-            usage = {}
-        if not isinstance(usage, dict):
-            usage = {}
+            cur = await db.execute(
+                "SELECT usage_json FROM messages WHERE id = ? AND chat_id = ?",
+                (int(message_id), clean_chat_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return None
 
-        raw_existing = usage.get("code_handoffs")
-        existing: list[dict[str, Any]] = []
-        if isinstance(raw_existing, list):
-            for item in raw_existing:
-                if isinstance(item, dict) and str(item.get("target_chat_id") or "").strip():
-                    existing.append(dict(item))
-
-        h_in = handoff if isinstance(handoff, dict) else {}
-        target_chat_id = str(h_in.get("target_chat_id") or "").strip()[:120]
-        if not target_chat_id:
-            return existing
-
-        target_title = (str(h_in.get("target_title") or "").strip() or "Диалог")[:160]
-        target_icon = str(h_in.get("target_icon") or "").strip()[:16]
-        access_mode = (str(h_in.get("access_mode") or "").strip() or "write_files")[:32]
-        project_name = str(h_in.get("project_name") or "").strip()[:120]
-        sent_at = str(h_in.get("sent_at") or "").strip()[:64] or utc_now_iso()
-
-        prev_item: Optional[dict[str, Any]] = None
-        filtered: list[dict[str, Any]] = []
-        for item in existing:
-            if str(item.get("target_chat_id") or "").strip() == target_chat_id:
-                prev_item = item
-            else:
-                filtered.append(item)
-
-        if prev_item is not None:
+            raw_usage = row["usage_json"] or ""
             try:
-                prev_count = int(prev_item.get("send_count") or 1)
+                usage = json.loads(raw_usage) if raw_usage else {}
             except Exception:
-                prev_count = 1
-            send_count = max(1, prev_count) + 1
-            eff_icon = target_icon or str(prev_item.get("target_icon") or "").strip()[:16]
-            eff_proj = project_name or str(prev_item.get("project_name") or "").strip()[:120]
-        else:
-            send_count = 1
-            eff_icon = target_icon
-            eff_proj = project_name
+                usage = {}
+            if not isinstance(usage, dict):
+                usage = {}
 
-        filtered.append(
-            {
-                "target_chat_id": target_chat_id,
-                "target_title": target_title,
-                "target_icon": eff_icon,
-                "access_mode": access_mode,
-                "project_name": eff_proj,
-                "sent_at": sent_at,
-                "send_count": send_count,
-            }
-        )
-        code_handoffs = filtered[-12:]
-        usage["code_handoffs"] = code_handoffs
+            raw_existing = usage.get("code_handoffs")
+            existing: list[dict[str, Any]] = []
+            if isinstance(raw_existing, list):
+                for item in raw_existing:
+                    if isinstance(item, dict) and str(item.get("target_chat_id") or "").strip():
+                        existing.append(dict(item))
 
-        await db.execute(
-            "UPDATE messages SET usage_json = ? WHERE id = ? AND chat_id = ?",
-            (json.dumps(usage, ensure_ascii=False), int(message_id), clean_chat_id),
-        )
-        await db.commit()
+            h_in = handoff if isinstance(handoff, dict) else {}
+            target_chat_id = str(h_in.get("target_chat_id") or "").strip()[:120]
+            if not target_chat_id:
+                await db.rollback()
+                return existing
+
+            target_title = (str(h_in.get("target_title") or "").strip() or "Диалог")[:160]
+            target_icon = str(h_in.get("target_icon") or "").strip()[:16]
+            access_mode = (str(h_in.get("access_mode") or "").strip() or "write_files")[:32]
+            project_name = str(h_in.get("project_name") or "").strip()[:120]
+            sent_at = str(h_in.get("sent_at") or "").strip()[:64] or utc_now_iso()
+
+            prev_item: Optional[dict[str, Any]] = None
+            filtered: list[dict[str, Any]] = []
+            for item in existing:
+                if str(item.get("target_chat_id") or "").strip() == target_chat_id:
+                    prev_item = item
+                else:
+                    filtered.append(item)
+
+            if prev_item is not None:
+                try:
+                    prev_count = int(prev_item.get("send_count") or 1)
+                except Exception:
+                    prev_count = 1
+                send_count = max(1, prev_count) + 1
+                eff_icon = target_icon or str(prev_item.get("target_icon") or "").strip()[:16]
+                eff_proj = project_name or str(prev_item.get("project_name") or "").strip()[:120]
+            else:
+                send_count = 1
+                eff_icon = target_icon
+                eff_proj = project_name
+
+            filtered.append(
+                {
+                    "target_chat_id": target_chat_id,
+                    "target_title": target_title,
+                    "target_icon": eff_icon,
+                    "access_mode": access_mode,
+                    "project_name": eff_proj,
+                    "sent_at": sent_at,
+                    "send_count": send_count,
+                }
+            )
+            code_handoffs = filtered[-12:]
+            usage["code_handoffs"] = code_handoffs
+
+            await db.execute(
+                "UPDATE messages SET usage_json = ? WHERE id = ? AND chat_id = ?",
+                (json.dumps(usage, ensure_ascii=False), int(message_id), clean_chat_id),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
         invalidate_chat_list_cache(clean_chat_id)
-        _bump_usage_ledger_version(message_id)
         return code_handoffs
 
 
@@ -3843,124 +4108,131 @@ async def append_message_hq_return(
         return None
     async with connect_db() as db:
         db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            "SELECT usage_json FROM messages WHERE id = ? AND chat_id = ?",
-            (int(message_id), clean_chat_id),
-        )
-        row = await cur.fetchone()
-        if not row:
-            return None
-
-        raw_usage = row["usage_json"] or ""
+        await db.execute("BEGIN IMMEDIATE")
         try:
-            usage = json.loads(raw_usage) if raw_usage else {}
-        except Exception:
-            usage = {}
-        if not isinstance(usage, dict):
-            usage = {}
+            cur = await db.execute(
+                "SELECT usage_json FROM messages WHERE id = ? AND chat_id = ?",
+                (int(message_id), clean_chat_id),
+            )
+            row = await cur.fetchone()
+            if not row:
+                await db.rollback()
+                return None
 
-        raw_existing = usage.get("hq_returns")
-        existing: list[dict[str, Any]] = []
-        if isinstance(raw_existing, list):
-            for item in raw_existing:
-                if isinstance(item, dict) and str(item.get("target_chat_id") or "").strip():
-                    existing.append(dict(item))
-
-        h_in = hq_return if isinstance(hq_return, dict) else {}
-        target_chat_id = str(h_in.get("target_chat_id") or "").strip()[:120]
-        if not target_chat_id:
-            return existing
-
-        raw_title = str(h_in.get("target_title") or "").strip()
-        raw_icon = str(h_in.get("target_icon") or "").strip()
-        project_name = str(h_in.get("project_name") or "").strip()[:120]
-        raw_sent_at = str(h_in.get("sent_at") or "").strip()[:64]
-        return_uid = str(h_in.get("return_uid") or "").strip()[:64]
-        increment_count = bool(h_in.get("increment_count", True))
-
-        raw_target_msg_id = h_in.get("target_msg_id")
-        target_msg_id: Optional[int] = None
-        if raw_target_msg_id is not None and not isinstance(raw_target_msg_id, bool):
+            raw_usage = row["usage_json"] or ""
             try:
-                parsed_mid = int(raw_target_msg_id)
-                if parsed_mid > 0:
-                    target_msg_id = parsed_mid
+                usage = json.loads(raw_usage) if raw_usage else {}
             except Exception:
-                target_msg_id = None
+                usage = {}
+            if not isinstance(usage, dict):
+                usage = {}
 
-        prev_item: Optional[dict[str, Any]] = None
-        filtered: list[dict[str, Any]] = []
-        for item in existing:
-            if str(item.get("target_chat_id") or "").strip() == target_chat_id:
-                prev_item = item
-            else:
-                filtered.append(item)
+            raw_existing = usage.get("hq_returns")
+            existing: list[dict[str, Any]] = []
+            if isinstance(raw_existing, list):
+                for item in raw_existing:
+                    if isinstance(item, dict) and str(item.get("target_chat_id") or "").strip():
+                        existing.append(dict(item))
 
-        if prev_item is not None:
-            try:
-                prev_count = max(1, int(prev_item.get("send_count") or 1))
-            except Exception:
-                prev_count = 1
-            prev_uid = str(prev_item.get("return_uid") or "").strip()[:64]
-            same_uid = bool(return_uid and prev_uid == return_uid)
-            should_increment = bool(increment_count and not same_uid)
-            send_count = prev_count + 1 if should_increment else prev_count
+            h_in = hq_return if isinstance(hq_return, dict) else {}
+            target_chat_id = str(h_in.get("target_chat_id") or "").strip()[:120]
+            if not target_chat_id:
+                await db.rollback()
+                return existing
 
-            prev_mid_raw = prev_item.get("target_msg_id")
-            prev_mid: Optional[int] = None
-            if prev_mid_raw is not None and not isinstance(prev_mid_raw, bool):
+            raw_title = str(h_in.get("target_title") or "").strip()
+            raw_icon = str(h_in.get("target_icon") or "").strip()
+            project_name = str(h_in.get("project_name") or "").strip()[:120]
+            raw_sent_at = str(h_in.get("sent_at") or "").strip()[:64]
+            return_uid = str(h_in.get("return_uid") or "").strip()[:64]
+            increment_count = bool(h_in.get("increment_count", True))
+
+            raw_target_msg_id = h_in.get("target_msg_id")
+            target_msg_id: Optional[int] = None
+            if raw_target_msg_id is not None and not isinstance(raw_target_msg_id, bool):
                 try:
-                    pm = int(prev_mid_raw)
-                    if pm > 0:
-                        prev_mid = pm
+                    parsed_mid = int(raw_target_msg_id)
+                    if parsed_mid > 0:
+                        target_msg_id = parsed_mid
                 except Exception:
-                    prev_mid = None
+                    target_msg_id = None
 
-            if target_msg_id is not None:
+            prev_item: Optional[dict[str, Any]] = None
+            filtered: list[dict[str, Any]] = []
+            for item in existing:
+                if str(item.get("target_chat_id") or "").strip() == target_chat_id:
+                    prev_item = item
+                else:
+                    filtered.append(item)
+
+            if prev_item is not None:
+                try:
+                    prev_count = max(1, int(prev_item.get("send_count") or 1))
+                except Exception:
+                    prev_count = 1
+                prev_uid = str(prev_item.get("return_uid") or "").strip()[:64]
+                same_uid = bool(return_uid and prev_uid == return_uid)
+                should_increment = bool(increment_count and not same_uid)
+                send_count = prev_count + 1 if should_increment else prev_count
+
+                prev_mid_raw = prev_item.get("target_msg_id")
+                prev_mid: Optional[int] = None
+                if prev_mid_raw is not None and not isinstance(prev_mid_raw, bool):
+                    try:
+                        pm = int(prev_mid_raw)
+                        if pm > 0:
+                            prev_mid = pm
+                    except Exception:
+                        prev_mid = None
+
+                if target_msg_id is not None:
+                    eff_target_msg_id = target_msg_id
+                elif not should_increment:
+                    eff_target_msg_id = prev_mid
+                else:
+                    eff_target_msg_id = None
+
+                eff_title = (raw_title or str(prev_item.get("target_title") or "").strip() or "Штаб")[:160]
+                eff_icon = (raw_icon or str(prev_item.get("target_icon") or "").strip() or "🏠")[:16]
+                eff_proj = project_name or str(prev_item.get("project_name") or "").strip()[:120]
+                if should_increment:
+                    eff_sent_at = raw_sent_at or utc_now_iso()
+                else:
+                    eff_sent_at = raw_sent_at or str(prev_item.get("sent_at") or "").strip()[:64] or utc_now_iso()
+                eff_uid = return_uid or prev_uid
+            else:
+                send_count = 1
                 eff_target_msg_id = target_msg_id
-            elif not should_increment:
-                eff_target_msg_id = prev_mid
-            else:
-                eff_target_msg_id = None
-
-            eff_title = (raw_title or str(prev_item.get("target_title") or "").strip() or "Штаб")[:160]
-            eff_icon = (raw_icon or str(prev_item.get("target_icon") or "").strip() or "🏠")[:16]
-            eff_proj = project_name or str(prev_item.get("project_name") or "").strip()[:120]
-            if should_increment:
+                eff_title = (raw_title or "Штаб")[:160]
+                eff_icon = (raw_icon or "🏠")[:16]
+                eff_proj = project_name
                 eff_sent_at = raw_sent_at or utc_now_iso()
-            else:
-                eff_sent_at = raw_sent_at or str(prev_item.get("sent_at") or "").strip()[:64] or utc_now_iso()
-            eff_uid = return_uid or prev_uid
-        else:
-            send_count = 1
-            eff_target_msg_id = target_msg_id
-            eff_title = (raw_title or "Штаб")[:160]
-            eff_icon = (raw_icon or "🏠")[:16]
-            eff_proj = project_name
-            eff_sent_at = raw_sent_at or utc_now_iso()
-            eff_uid = return_uid
+                eff_uid = return_uid
 
-        entry_out: dict[str, Any] = {
-            "target_chat_id": target_chat_id,
-            "target_title": eff_title,
-            "target_icon": eff_icon,
-            "project_name": eff_proj,
-            "target_msg_id": eff_target_msg_id,
-            "sent_at": eff_sent_at,
-            "send_count": send_count,
-        }
-        if eff_uid:
-            entry_out["return_uid"] = eff_uid
+            entry_out: dict[str, Any] = {
+                "target_chat_id": target_chat_id,
+                "target_title": eff_title,
+                "target_icon": eff_icon,
+                "project_name": eff_proj,
+                "target_msg_id": eff_target_msg_id,
+                "sent_at": eff_sent_at,
+                "send_count": send_count,
+            }
+            if eff_uid:
+                entry_out["return_uid"] = eff_uid
 
-        filtered.append(entry_out)
-        hq_returns = filtered[-12:]
-        usage["hq_returns"] = hq_returns
+            filtered.append(entry_out)
+            hq_returns = filtered[-12:]
+            usage["hq_returns"] = hq_returns
 
-        await db.execute(
-            "UPDATE messages SET usage_json = ? WHERE id = ? AND chat_id = ?",
-            (json.dumps(usage, ensure_ascii=False), int(message_id), clean_chat_id),
-        )
-        await db.commit()
+            await db.execute(
+                "UPDATE messages SET usage_json = ? WHERE id = ? AND chat_id = ?",
+                (json.dumps(usage, ensure_ascii=False), int(message_id), clean_chat_id),
+            )
+            await db.commit()
+        except BaseException:
+            await db.rollback()
+            raise
         invalidate_chat_list_cache(clean_chat_id)
         _bump_usage_ledger_version(message_id)
         return hq_returns
@@ -4630,7 +4902,15 @@ def _parse_iso_utc(raw: str) -> Optional[datetime]:
 # ---------------------------------------------------------------------------
 _USAGE_LEDGER_VERSION = 0
 _USAGE_LEDGER_MAX_AGE_SEC = 60.0
-_USAGE_LEDGER_CACHE: dict[str, Any] = {"path": "", "version": -1, "rows": [], "rows_by_id": {}, "last_id": 0, "dirty": set()}
+_USAGE_LEDGER_CACHE: dict[str, Any] = {
+    "path": "",
+    "version": -1,
+    "rows": [],
+    "rows_by_id": {},
+    "last_id": 0,
+    "dirty": set(),
+    "evicted_chats": set(),
+}
 
 
 def _bump_usage_ledger_version(message_id: Optional[int] = None) -> None:
@@ -4642,7 +4922,15 @@ def _bump_usage_ledger_version(message_id: Optional[int] = None) -> None:
 
 def _reset_usage_ledger_cache() -> None:
     _bump_usage_ledger_version()
-    _USAGE_LEDGER_CACHE.update(path="", version=-1, rows=[], rows_by_id={}, last_id=0, dirty=set())
+    _USAGE_LEDGER_CACHE.update(
+        path="",
+        version=-1,
+        rows=[],
+        rows_by_id={},
+        last_id=0,
+        dirty=set(),
+        evicted_chats=set(),
+    )
 
 
 def _usage_total_tokens(u: dict[str, Any]) -> int:
@@ -4654,11 +4942,21 @@ def _usage_total_tokens(u: dict[str, Any]) -> int:
     )
 
 
-_USAGE_LEDGER_LOCK = asyncio.Lock()
+_USAGE_LEDGER_LOCK: Optional[asyncio.Lock] = None
+_USAGE_LEDGER_LOCK_LOOP: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _get_usage_ledger_lock() -> asyncio.Lock:
+    global _USAGE_LEDGER_LOCK, _USAGE_LEDGER_LOCK_LOOP
+    loop = asyncio.get_running_loop()
+    if _USAGE_LEDGER_LOCK is None or _USAGE_LEDGER_LOCK_LOOP is not loop:
+        _USAGE_LEDGER_LOCK = asyncio.Lock()
+        _USAGE_LEDGER_LOCK_LOOP = loop
+    return _USAGE_LEDGER_LOCK
 
 
 async def _get_usage_ledger():
-    async with _USAGE_LEDGER_LOCK:
+    async with _get_usage_ledger_lock():
         return await _get_usage_ledger_unlocked()
 
 
@@ -4673,26 +4971,56 @@ async def _get_usage_ledger_unlocked() -> list[tuple[str, str, str, dict[str, An
     version = _USAGE_LEDGER_VERSION
     dirty = set(cache["dirty"])
     cache["dirty"].difference_update(dirty)
-    lower = min(dirty | {cache["last_id"] + 1})
+    evicted_chats = set(cache.setdefault("evicted_chats", set()))
+    cache["evicted_chats"].difference_update(evicted_chats)
+    prev_last_id = int(cache["last_id"] or 0)
+    dirty_existing = sorted(mid for mid in dirty if mid <= prev_last_id)
+    raw_rows: list[Any] = []
     try:
         async with connect_db() as db:
             cur = await db.execute(
-                "SELECT id, chat_id, user_id, model, usage_json, created_at FROM messages WHERE role = 'assistant' AND id >= ? ORDER BY id",
-                (lower,))
-            raw_rows = await cur.fetchall()
+                "SELECT id, chat_id, user_id, model, usage_json, created_at "
+                "FROM messages WHERE role = 'assistant' AND id > ? ORDER BY id",
+                (prev_last_id,),
+            )
+            raw_rows.extend(await cur.fetchall())
+            for idx in range(0, len(dirty_existing), 400):
+                batch = dirty_existing[idx : idx + 400]
+                placeholders = ",".join("?" for _ in batch)
+                cur_d = await db.execute(
+                    f"SELECT id, chat_id, user_id, model, usage_json, created_at "
+                    f"FROM messages WHERE role = 'assistant' AND id IN ({placeholders})",
+                    batch,
+                )
+                raw_rows.extend(await cur_d.fetchall())
     except BaseException:
         cache["dirty"].update(dirty)
+        cache["evicted_chats"].update(evicted_chats)
         raise
+    if evicted_chats:
+        for mid in [k for k, v in cache["rows_by_id"].items() if v[0] in evicted_chats]:
+            cache["rows_by_id"].pop(mid, None)
+    for mid in dirty_existing:
+        cache["rows_by_id"].pop(mid, None)
     for mid, chat_id, user_id, model, raw, created_at in raw_rows:
         cache["last_id"] = max(cache["last_id"], mid)
         cache["rows_by_id"].pop(mid, None)
         try:
             usage = json.loads(raw or "{}")
+            if not isinstance(usage, dict):
+                continue
             total = _usage_total_tokens(usage)
         except (ValueError, TypeError, AttributeError):
             continue
         if total > 0:
-            cache["rows_by_id"][mid] = (str(chat_id or ""), str(user_id or ""), str(model or ""), usage, _parse_iso_utc(str(created_at or "")), total)
+            cache["rows_by_id"][mid] = (
+                str(chat_id or ""),
+                str(user_id or ""),
+                str(model or ""),
+                usage,
+                _parse_iso_utc(str(created_at or "")),
+                total,
+            )
     cache["rows"] = list(cache["rows_by_id"].values())
     cache["version"] = version
     return cache["rows"]
@@ -4702,39 +5030,22 @@ async def get_user_24h_tokens(user_id: str) -> int:
     """Fast 24h token sum for admin's Google CLI daily limit enforcement.
     Strictly excludes turns executed on the user's own personal ChatGPT (`chatgpt_codex`)
     or personal Anthropic Claude Code (`claude_code`) subscriptions."""
-    cut_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    async with connect_db() as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute(
-            """
-            SELECT model, usage_json, created_at
-            FROM messages
-            WHERE role = 'assistant' AND user_id = ? AND created_at >= ?
-              AND usage_json != '' AND usage_json != '{}'
-            """,
-            (user_id, cut_iso),
-        )
-        rows = await cur.fetchall()
-
+    cut_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+    target_uid = str(user_id or "")
+    ledger = await _get_usage_ledger()
     total = 0
-    for r in rows:
-        m_str = str(r["model"] or "").strip()
-        if m_str.startswith(("codex:", "claude-code:")):
+    for _chat_id, r_user_id, r_model, u, dt, tot in ledger:
+        if r_user_id != target_uid:
             continue
-        try:
-            u = json.loads(r["usage_json"] or "{}")
-        except Exception:
+        if not dt or dt < cut_24h:
+            continue
+        m_str = str(r_model or "").strip()
+        if m_str.startswith(("codex:", "claude-code:")):
             continue
         if not isinstance(u, dict):
             continue
         if str(u.get("provider") or "").strip().lower() in ("chatgpt_codex", "claude_code"):
             continue
-        tot = int(u.get("total_tokens") or 0) or (
-            int(u.get("input_tokens") or 0)
-            + int(u.get("output_tokens") or 0)
-            + int(u.get("thinking_tokens") or 0)
-            + int(u.get("cache_read_tokens") or 0)
-        )
         if tot > 0:
             total += tot
     return total
@@ -8946,16 +9257,50 @@ async def rename_project_records(*, old_name: str, new_name: str, old_dir: Path,
                 await db.execute("UPDATE chats SET project_name=?, project_path=? WHERE id=?", (new_name, str(new_dir), chat["id"]))
                 messages = await (await db.execute("SELECT id, attachments_json, usage_json FROM messages WHERE chat_id=?", (chat["id"],))).fetchall()
                 for msg in messages:
-                    attachments = json.loads(msg["attachments_json"] or "[]")
-                    for a in attachments:
-                        if isinstance(a, dict) and a.get("disk_path"):
-                            a["disk_path"] = _rewrite_relocated_path(a["disk_path"], old_dir, new_dir)[0]
-                    usage = json.loads(msg["usage_json"] or "{}")
-                    for field in ("code_handoffs", "hq_returns"):
-                        for item in usage.get(field, []):
-                            if isinstance(item, dict) and str(item.get("project_name", "")).lower() == old_name.lower():
-                                item["project_name"] = new_name
-                    await db.execute("UPDATE messages SET attachments_json=?, usage_json=? WHERE id=?", (json.dumps(attachments, ensure_ascii=False), json.dumps(usage, ensure_ascii=False), msg["id"]))
+                    att_changed = False
+                    try:
+                        attachments = json.loads(msg["attachments_json"] or "[]")
+                    except Exception:
+                        attachments = []
+                    if isinstance(attachments, list):
+                        for a in attachments:
+                            if isinstance(a, dict) and a.get("disk_path"):
+                                new_dp, dp_changed = _rewrite_relocated_path(a["disk_path"], old_dir, new_dir)
+                                if dp_changed or new_dp != a["disk_path"]:
+                                    a["disk_path"] = new_dp
+                                    att_changed = True
+                    usage_changed = False
+                    try:
+                        usage = json.loads(msg["usage_json"] or "{}")
+                    except Exception:
+                        usage = {}
+                    if isinstance(usage, dict):
+                        for field in ("code_handoffs", "hq_returns"):
+                            items = usage.get(field)
+                            if not isinstance(items, list):
+                                continue
+                            for item in items:
+                                if isinstance(item, dict) and str(item.get("project_name", "")).lower() == old_name.lower():
+                                    if item.get("project_name") != new_name:
+                                        item["project_name"] = new_name
+                                        usage_changed = True
+                    elif not att_changed:
+                        continue
+                    if att_changed and usage_changed:
+                        await db.execute(
+                            "UPDATE messages SET attachments_json=?, usage_json=? WHERE id=?",
+                            (json.dumps(attachments, ensure_ascii=False), json.dumps(usage, ensure_ascii=False), msg["id"]),
+                        )
+                    elif att_changed:
+                        await db.execute(
+                            "UPDATE messages SET attachments_json=? WHERE id=?",
+                            (json.dumps(attachments, ensure_ascii=False), msg["id"]),
+                        )
+                    elif usage_changed:
+                        await db.execute(
+                            "UPDATE messages SET usage_json=? WHERE id=?",
+                            (json.dumps(usage, ensure_ascii=False), msg["id"]),
+                        )
             row = await (await db.execute("SELECT * FROM project_memories WHERE scope_key=?", (old_scope,))).fetchone()
             if row or owner_id == "admin" or is_shared:
                 if not row:

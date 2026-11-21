@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import io
 import ipaddress
 import time
-from collections import defaultdict
 from typing import Any, Optional
 
 import segno
@@ -17,9 +17,12 @@ from .config import HUB_SECRET_KEY, get_pin
 TOKEN_TTL_SECONDS = 90 * 24 * 3600  # 90 days for seamless mobile PWA usage
 COOKIE_NAME = "agy_hub_session"
 
-# Brute-force protection: key (IP or IP:username) -> list of failed attempt timestamps
-_FAILED_ATTEMPTS: dict[str, list[float]] = defaultdict(list)
+# Brute-force protection: key (IP, IP:username, or user:username) -> list of failed attempt timestamps
+_FAILED_ATTEMPTS: dict[str, list[float]] = {}
 MAX_ATTEMPTS_PER_MINUTE = 6
+MAX_USER_ATTEMPTS_PER_10M = 20
+USER_WINDOW_SECONDS = 600.0
+_MAX_TRACKED_KEYS = 4096
 _TRUSTED_LOCAL_PROXIES = {"127.0.0.1", "::1"}
 
 
@@ -141,32 +144,79 @@ async def resolve_token_user(token: Optional[str]) -> Optional[dict[str, Any]]:
     return None
 
 
+def _prune_failed_attempts(now: float) -> None:
+    if len(_FAILED_ATTEMPTS) <= _MAX_TRACKED_KEYS:
+        return
+    for key in list(_FAILED_ATTEMPTS.keys()):
+        window = USER_WINDOW_SECONDS if key.startswith("user:") else 60.0
+        recent = [t for t in _FAILED_ATTEMPTS.get(key, ()) if now - t < window]
+        if recent:
+            _FAILED_ATTEMPTS[key] = recent
+        else:
+            _FAILED_ATTEMPTS.pop(key, None)
+    while len(_FAILED_ATTEMPTS) > _MAX_TRACKED_KEYS:
+        oldest_key = min(
+            _FAILED_ATTEMPTS.keys(),
+            key=lambda k: _FAILED_ATTEMPTS[k][-1] if _FAILED_ATTEMPTS[k] else 0.0,
+        )
+        _FAILED_ATTEMPTS.pop(oldest_key, None)
+
+
 def check_rate_limit(client_ip: str, username: str = "") -> None:
     now = time.time()
+    uname = (username or "").strip().lower()
     keys = [client_ip]
-    if username:
-        keys.append(f"{client_ip}:{username.lower()}")
+    if uname:
+        keys.append(f"{client_ip}:{uname}")
     for k in keys:
-        recent = [t for t in _FAILED_ATTEMPTS[k] if now - t < 60.0]
-        _FAILED_ATTEMPTS[k] = recent
+        existing = _FAILED_ATTEMPTS.get(k)
+        if not existing:
+            _FAILED_ATTEMPTS.pop(k, None)
+            continue
+        recent = [t for t in existing if now - t < 60.0]
+        if recent:
+            _FAILED_ATTEMPTS[k] = recent
+        else:
+            _FAILED_ATTEMPTS.pop(k, None)
         if len(recent) >= MAX_ATTEMPTS_PER_MINUTE:
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Слишком много неверных попыток входа. Подождите 1 минуту.",
             )
+    if uname:
+        u_key = f"user:{uname}"
+        existing_u = _FAILED_ATTEMPTS.get(u_key)
+        if not existing_u:
+            _FAILED_ATTEMPTS.pop(u_key, None)
+        else:
+            recent_u = [t for t in existing_u if now - t < USER_WINDOW_SECONDS]
+            if recent_u:
+                _FAILED_ATTEMPTS[u_key] = recent_u
+            else:
+                _FAILED_ATTEMPTS.pop(u_key, None)
+            if len(recent_u) >= MAX_USER_ATTEMPTS_PER_10M:
+                raise HTTPException(
+                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                    detail="Слишком много неверных попыток входа. Подождите несколько минут.",
+                )
 
 
 def record_failed_attempt(client_ip: str, username: str = "") -> None:
     now = time.time()
-    _FAILED_ATTEMPTS[client_ip].append(now)
-    if username:
-        _FAILED_ATTEMPTS[f"{client_ip}:{username.lower()}"].append(now)
+    uname = (username or "").strip().lower()
+    _FAILED_ATTEMPTS.setdefault(client_ip, []).append(now)
+    if uname:
+        _FAILED_ATTEMPTS.setdefault(f"{client_ip}:{uname}", []).append(now)
+        _FAILED_ATTEMPTS.setdefault(f"user:{uname}", []).append(now)
+    _prune_failed_attempts(now)
 
 
 def clear_failed_attempts(client_ip: str, username: str = "") -> None:
     _FAILED_ATTEMPTS.pop(client_ip, None)
-    if username:
-        _FAILED_ATTEMPTS.pop(f"{client_ip}:{username.lower()}", None)
+    uname = (username or "").strip().lower()
+    if uname:
+        _FAILED_ATTEMPTS.pop(f"{client_ip}:{uname}", None)
+        _FAILED_ATTEMPTS.pop(f"user:{uname}", None)
 
 
 async def authenticate_credentials(
@@ -185,7 +235,7 @@ async def authenticate_credentials(
     auth_row = await database.get_user_auth_by_username(clean_user)
     if not auth_row:
         # Constant-ish work dummy hash to prevent username timing enumeration
-        database.hash_secret("dummy_anti_timing_probe")
+        await asyncio.to_thread(database.hash_secret, "dummy_anti_timing_probe")
         record_failed_attempt(client_ip, clean_user)
         return None
 
@@ -196,7 +246,9 @@ async def authenticate_credentials(
             detail="Эта учётная запись временно заблокирована администратором",
         )
 
-    matched = database.verify_secret(clean_secret, auth_row.get("password_hash", ""))
+    matched = await asyncio.to_thread(
+        database.verify_secret, clean_secret, auth_row.get("password_hash", "")
+    )
 
     # Local emergency recovery for built-in admin if owner updated HUB_PIN directly in .env
     if not matched and auth_row["id"] == "admin":

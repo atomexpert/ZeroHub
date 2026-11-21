@@ -239,18 +239,33 @@ class StationContext:
 
     def close(self):
         # The original desktop belongs to the original station: reconnect first.
-        if not self.u.SetProcessWindowStation(self.original_station):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if not self.u.SetThreadDesktop(self.original_desktop):
-            raise ctypes.WinError(ctypes.get_last_error())
-        if self.desktop:
-            if not self.u.CloseDesktop(self.desktop):
+        try:
+            if not self.u.SetProcessWindowStation(self.original_station):
                 raise ctypes.WinError(ctypes.get_last_error())
-            self.desktop = None
-        if self.station:
-            if not self.u.CloseWindowStation(self.station):
+            if not self.u.SetThreadDesktop(self.original_desktop):
                 raise ctypes.WinError(ctypes.get_last_error())
-            self.station = None
+        finally:
+            first_close_err = None
+            if self.desktop:
+                desktop = self.desktop
+                self.desktop = None
+                try:
+                    if not self.u.CloseDesktop(desktop):
+                        first_close_err = ctypes.WinError(ctypes.get_last_error())
+                except Exception as exc:
+                    first_close_err = exc
+            if self.station:
+                station = self.station
+                self.station = None
+                try:
+                    if not self.u.CloseWindowStation(station):
+                        if first_close_err is None:
+                            first_close_err = ctypes.WinError(ctypes.get_last_error())
+                except Exception as exc:
+                    if first_close_err is None:
+                        first_close_err = exc
+            if first_close_err is not None and sys.exc_info()[0] is None:
+                raise first_close_err
 
 
 def compatibility_probe():

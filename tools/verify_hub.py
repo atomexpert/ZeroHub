@@ -61,6 +61,16 @@ GOLDEN = tuple(
         "release_and_updater_v158",
         "ui_updates_and_publisher_v159",
         "ui_settings_tabs_v160",
+        "ui_sidebar_hierarchy_v162",
+        "no_echo_user_attachments_v163",
+        "chat_file_delivery_cards_v165",
+        "git_checkpoint_ignored_paths_v164",
+        "turn_duration_telemetry_v167",
+        "notifications_and_webpush_v168",
+        "audit_security_and_data_v169",
+        "audit_streaming_and_leaks_v169",
+        "audit_frontend_and_pwa_v169",
+        "sidebar_laptop_ergonomics_v170",
     )
 )
 
@@ -70,7 +80,7 @@ FORBIDDEN_NAME_PATTERNS = ("*.db*", ".env*")
 ALLOWED_NAMES = (".env.example",)
 SW_PATH = "app/static/sw.js"
 CACHE_NAME_RE = re.compile(r"""CACHE_NAME\s*=\s*["']agy-hub-v(\d+)["']""")
-STATIC_ASSET_RE = re.compile(r"^app/static/.+\.(?:js|css)$", re.IGNORECASE)
+STATIC_ASSET_RE = re.compile(r"^app/static/.+\.(?:js|css|html)$", re.IGNORECASE)
 # Git variables injected into hooks would redirect git calls made by tests to this repository.
 GIT_HOOK_ENV_VARS = (
     "GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX", "GIT_OBJECT_DIRECTORY",

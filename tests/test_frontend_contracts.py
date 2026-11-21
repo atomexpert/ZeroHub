@@ -21,6 +21,10 @@ CRITICAL_IDS = set("""
 MIN_LINKED_IDS = 918
 LINKED_IDS = set("""
     sidebarVersionBadge settingsModalVerBadge
+    settingsNotificationsCard notifHeading notifStatusPill notifDevicePushBar
+    notifTogglePushBtn notifTestPushBtn notifTestSoundBtn notifDeviceHint notifDevicesList
+    notifInAppToastChk notifSystemPushChk notifSoundChk notifOnTurnDoneChk
+    notifOnTurnErrorChk notifOnProcessCrashChk notifOnlyLongTurnsChk
     accEmailInput accLabelInput accProfileIdInput accProxyCustomBox accProxyGlobalHint
     accProxyModeGroup accProxySpecInput accProxyTestBtn accProxyTestResult accessModeSelect
     accountProfileForm accountProfilesList accountStatusPill activeChatArchivedPill
@@ -428,7 +432,12 @@ function smoke(width, height, userAgent) {
   vm.runInContext(app, sandbox, { filename: "app.js", timeout: 5000 });
   const api = context.__AGY_ADVISOR_API__;
   assert.ok(api, "Missing Advisor test API");
-  const dataExports = new Set(["els", "state", "mentionStatsCache", "tabViewCache", "COPY_STRIP_SELECTOR"]);
+  assert.equal(Object.prototype.toString.call(api.DELIVERABLE_FILE_EXT_RE), "[object RegExp]");
+  assert.ok(api.DELIVERABLE_FILE_EXT_RE.test("artifact.APK"));
+  assert.ok(!api.DELIVERABLE_FILE_EXT_RE.test("app.js"));
+  const dataExports = new Set([
+    "els", "state", "mentionStatsCache", "tabViewCache", "COPY_STRIP_SELECTOR", "DELIVERABLE_FILE_EXT_RE",
+  ]);
   for (const [name, method] of Object.entries(api)) {
     if (dataExports.has(name)) continue;
     assert.equal(typeof method, "function", name);

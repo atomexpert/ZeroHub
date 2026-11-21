@@ -149,20 +149,27 @@ def cleanup_stale_large_prompt_files(ttl_sec: float = 7200.0) -> int:
 
 
 async def storage_health():
+    def _batch_excess(raw_rows):
+        delta = 0
+        for (raw,) in raw_rows:
+            try:
+                slim = json.dumps(database.compact_tool_calls_payload(json.loads(raw)), ensure_ascii=False)
+                delta += max(0, len(raw.encode('utf-8')) - len(slim.encode('utf-8')))
+            except (ValueError, TypeError):
+                pass
+        return delta
+
     async with database.connect_db() as db:
         cur = await db.execute('SELECT id FROM chats')
         ids = {str(r[0]) for r in await cur.fetchall()}
         cur = await db.execute('SELECT COUNT(*) FROM messages')
         messages = (await cur.fetchone())[0]
         excess = 0
-        cur = await db.execute("SELECT tool_calls_json FROM messages WHERE tool_calls_json != '[]'")
+        cur = await db.execute(
+            "SELECT tool_calls_json FROM messages WHERE tool_calls_json IS NOT NULL AND tool_calls_json NOT IN ('', '[]')"
+        )
         while rows := await cur.fetchmany(100):
-            for (raw,) in rows:
-                try:
-                    slim = json.dumps(database.compact_tool_calls_payload(json.loads(raw)), ensure_ascii=False)
-                    excess += max(0, len(raw.encode('utf-8')) - len(slim.encode('utf-8')))
-                except (ValueError, TypeError):
-                    pass
+            excess += await asyncio.to_thread(_batch_excess, rows)
     db_path = Path(database._resolved_db_path())
     def sizes():
         db_size = tree_bytes(db_path)
@@ -177,34 +184,66 @@ async def storage_health():
 
 
 async def run_maintenance(can_vacuum):
+    def _compact_batch(batch_rows):
+        max_id = 0
+        updates = []
+        for mid, raw in batch_rows:
+            max_id = mid
+            raw_str = raw or ''
+            try:
+                slim = json.dumps(
+                    database.compact_tool_calls_payload(json.loads(raw_str or '[]')),
+                    ensure_ascii=False,
+                )
+            except (ValueError, TypeError):
+                continue
+            if len(slim.encode('utf-8')) < len(raw_str.encode('utf-8')):
+                updates.append((slim, mid, raw_str))
+        return max_id, updates
+
     async with maintenance_lock:
         before = await storage_health()
         slimmed = 0
         last_id = 0
         async with database.connect_db() as db:
             while True:
-                cur = await db.execute('SELECT id, tool_calls_json FROM messages WHERE id > ? ORDER BY id LIMIT 100', (last_id,))
+                cur = await db.execute(
+                    "SELECT id, tool_calls_json FROM messages "
+                    "WHERE id > ? AND status != 'streaming' "
+                    "AND tool_calls_json IS NOT NULL AND tool_calls_json NOT IN ('', '[]') "
+                    "ORDER BY id LIMIT 100",
+                    (last_id,),
+                )
                 rows = await cur.fetchall()
                 if not rows:
                     break
-                updates = []
-                for mid, raw in rows:
-                    last_id = mid
-                    try:
-                        slim = json.dumps(database.compact_tool_calls_payload(json.loads(raw or '[]')), ensure_ascii=False)
-                    except (ValueError, TypeError):
-                        continue
-                    if len(slim.encode('utf-8')) < len((raw or '').encode('utf-8')):
-                        updates.append((slim, mid))
-                await db.executemany('UPDATE messages SET tool_calls_json = ? WHERE id = ?', updates)
-                await db.commit()
-                slimmed += len(updates)
+                last_id, updates = await asyncio.to_thread(_compact_batch, rows)
+                if updates:
+                    upd_cur = await db.executemany(
+                        "UPDATE messages SET tool_calls_json = ? "
+                        "WHERE id = ? AND status != 'streaming' AND tool_calls_json = ?",
+                        updates,
+                    )
+                    await db.commit()
+                    if upd_cur.rowcount and upd_cur.rowcount > 0:
+                        slimmed += int(upd_cur.rowcount)
             cur = await db.execute('SELECT id FROM chats')
             ids = {str(r[0]) for r in await cur.fetchall()}
-            def clean_files():
-                cleanup_stale_large_prompt_files()
-                removed = sum(bool(safe_remove_upload(p, root)) for p, root in orphan_uploads(ids))
-                log = config.DATA_DIR / 'hub_server.log'
+
+        def clean_files():
+            cleanup_stale_large_prompt_files()
+            now_ts = time.time()
+            removed_cnt = 0
+            for p, root in orphan_uploads(ids):
+                try:
+                    if now_ts - p.stat().st_mtime < 600.0:
+                        continue
+                except OSError:
+                    continue
+                if safe_remove_upload(p, root):
+                    removed_cnt += 1
+            log = config.DATA_DIR / 'hub_server.log'
+            try:
                 if log.is_file() and log.stat().st_size > 10 * 1048576:
                     with log.open('r+b') as f:
                         f.seek(-2 * 1048576, 2)
@@ -212,8 +251,12 @@ async def run_maintenance(can_vacuum):
                         f.seek(0)
                         f.write(tail)
                         f.truncate()
-                return removed
-            removed = await asyncio.to_thread(clean_files)
+            except OSError:
+                pass
+            return removed_cnt
+
+        removed = await asyncio.to_thread(clean_files)
+        async with database.connect_db() as db:
             await db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
             await db.execute('PRAGMA optimize')
             vacuumed = bool(can_vacuum())

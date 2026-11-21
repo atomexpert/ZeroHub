@@ -594,19 +594,22 @@ def _openrouter_http_sync(
             parsed = json.loads(raw) if raw.strip() else {}
             return status_code, parsed if isinstance(parsed, dict) else {"data": parsed}
     except urllib.error.HTTPError as exc:
-        status_code = int(exc.code or 500)
-        raw_err = ""
         try:
-            raw_err = exc.read().decode("utf-8", errors="replace")
-        except Exception:
-            raw_err = str(exc.reason or "")
-        try:
-            parsed_err = json.loads(raw_err) if raw_err.strip() else {}
-            if not isinstance(parsed_err, dict):
-                parsed_err = {"error": {"message": str(parsed_err)}}
-        except Exception:
-            parsed_err = {"error": {"message": raw_err.strip() or f"HTTP {status_code}"}}
-        return status_code, parsed_err
+            status_code = int(exc.code or 500)
+            raw_err = ""
+            try:
+                raw_err = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw_err = str(exc.reason or "")
+            try:
+                parsed_err = json.loads(raw_err) if raw_err.strip() else {}
+                if not isinstance(parsed_err, dict):
+                    parsed_err = {"error": {"message": str(parsed_err)}}
+            except Exception:
+                parsed_err = {"error": {"message": raw_err.strip() or f"HTTP {status_code}"}}
+            return status_code, parsed_err
+        finally:
+            exc.close()
     except urllib.error.URLError as exc:
         if isinstance(getattr(exc, "reason", None), TimeoutError):
             raise TimeoutError(str(exc.reason)) from exc

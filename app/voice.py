@@ -54,7 +54,7 @@ ALLOWED_GIGAAM_MODELS = (GIGAAM_ACCURATE_MODEL, GIGAAM_FAST_MODEL)
 _model_lock = threading.Lock()
 _gigaam_lock = threading.Lock()
 _preview_cancel_lock = threading.Lock()
-_active_preview_cancel: Optional[threading.Event] = None
+_active_preview_cancels: dict[str, threading.Event] = {}
 
 # Dedicated 2-worker ASR pool so voice inference never competes with SQLite/file I/O
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="voice-asr")
@@ -1008,47 +1008,58 @@ async def transcribe_audio(
     model_name: str = "accurate",
     live_preview: bool = False,
     offset_sec: float = 0.0,
+    session_key: str = "_global",
 ) -> dict[str, Any]:
-    global _active_preview_cancel
+    key = str(session_key or "_global").strip() or "_global"
+    cancel_event: Optional[threading.Event] = (
+        threading.Event() if live_preview else None
+    )
     with _preview_cancel_lock:
-        if _active_preview_cancel is not None:
-            _active_preview_cancel.set()
-        cancel_event: Optional[threading.Event] = (
-            threading.Event() if live_preview else None
+        prev_cancel = _active_preview_cancels.get(key)
+        if prev_cancel is not None:
+            prev_cancel.set()
+        if cancel_event is not None:
+            _active_preview_cancels[key] = cancel_event
+        else:
+            _active_preview_cancels.pop(key, None)
+
+    try:
+        proxy_url: Any = _UNSET_PROXY
+        eff_engine, eff_model = resolve_voice_route(
+            engine=engine,
+            language=language,
+            model_name=model_name,
+            is_live=live_preview,
+            allow_groq=not live_preview,
         )
-        _active_preview_cancel = cancel_event
+        if _route_needs_outbound_proxy(eff_engine, eff_model):
+            try:
+                proxy_url = await proxy_router.ensure_proxy_for_context("global")
+            except proxy_router.ProxyRouteError as exc:
+                if eff_engine == "groq":
+                    logger.warning("Global proxy route failed for Groq (%s), using offline local ASR", exc)
+                    engine = "gigaam" if _has_onnx_asr() else "whisper"
+                else:
+                    raise
 
-    proxy_url: Any = _UNSET_PROXY
-    eff_engine, eff_model = resolve_voice_route(
-        engine=engine,
-        language=language,
-        model_name=model_name,
-        is_live=live_preview,
-        allow_groq=not live_preview,
-    )
-    if _route_needs_outbound_proxy(eff_engine, eff_model):
-        try:
-            proxy_url = await proxy_router.ensure_proxy_for_context("global")
-        except proxy_router.ProxyRouteError as exc:
-            if eff_engine == "groq":
-                logger.warning("Global proxy route failed for Groq (%s), using offline local ASR", exc)
-                engine = "gigaam" if _has_onnx_asr() else "whisper"
-            else:
-                raise
-
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _executor,
-        _transcribe_sync,
-        audio_bytes,
-        language,
-        engine,
-        model_name,
-        live_preview,
-        offset_sec,
-        cancel_event,
-        proxy_url,
-    )
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            _executor,
+            _transcribe_sync,
+            audio_bytes,
+            language,
+            engine,
+            model_name,
+            live_preview,
+            offset_sec,
+            cancel_event,
+            proxy_url,
+        )
+    finally:
+        if cancel_event is not None:
+            with _preview_cancel_lock:
+                if _active_preview_cancels.get(key) is cancel_event:
+                    _active_preview_cancels.pop(key, None)
 
 
 # ---------------------------------------------------------------------------

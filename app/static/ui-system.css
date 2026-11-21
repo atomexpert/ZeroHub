@@ -240,6 +240,192 @@
 }
 
 @layer components {
+  #settingsNotificationsCard {
+    display: grid;
+    gap: 9px;
+    min-width: 0;
+    padding: 12px;
+    border: var(--ui-border-hairline);
+    border-radius: var(--ui-radius-md);
+    background: var(--bg-surface-elevated);
+  }
+
+  #settingsNotificationsCard :is(.notif-heading, #notifDevicePushBar, #notifDevicesList) {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  #settingsNotificationsCard .notif-heading {
+    justify-content: space-between;
+  }
+
+  #settingsNotificationsCard :is(h3, p) {
+    margin: 0;
+  }
+
+  #notifDevicePushBar button {
+    white-space: normal;
+    max-width: 100%;
+  }
+
+  #notifDevicesList:empty, .notif-device-hint:empty {
+    display: none;
+  }
+
+  .notif-device-hint {
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+  }
+
+  #settingsNotificationsCard .notif-prefs {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  #settingsNotificationsCard .checkbox-stack {
+    display: grid;
+    gap: 8px;
+    align-content: start;
+  }
+
+  #settingsNotificationsCard label {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    overflow-wrap: anywhere;
+  }
+
+  #settingsNotificationsCard input {
+    flex: none;
+  }
+
+  .notif-device-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+    max-width: 100%;
+    padding-inline: 8px 2px;
+    border: var(--ui-border-hairline);
+    border-radius: var(--ui-radius-md);
+    font-size: 12px;
+  }
+
+  .notif-device-chip span {
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  .notif-device-chip button {
+    flex: none;
+    min-width: 28px;
+    min-height: 28px;
+    padding: 0;
+  }
+
+  .toast.is-done { border-inline-start: 3px solid var(--status-emerald); }
+  .toast.is-warn { border-inline-start: 3px solid var(--status-amber); }
+  .toast.is-error { border-inline-start: 3px solid var(--status-red); }
+
+  @media (max-width: 540px) {
+    #settingsNotificationsCard .notif-prefs { grid-template-columns: minmax(0, 1fr); }
+  }
+
+  .gen-file-card {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    box-sizing: border-box;
+    max-width: min(460px, 100%);
+    padding: 10px 12px;
+    border: var(--ui-border-hairline);
+    border-radius: var(--ui-radius-md);
+    background: var(--bg-surface-elevated);
+  }
+
+  .gen-file-badge {
+    display: grid;
+    place-items: center;
+    width: 38px;
+    height: 38px;
+    flex-shrink: 0;
+    border-radius: 9px;
+    background: color-mix(in srgb, var(--accent) 14%, var(--bg-surface));
+    color: var(--accent);
+  }
+
+  .gen-file-ext {
+    font: 700 11px var(--font-mono);
+    text-transform: uppercase;
+  }
+
+  .gen-file-meta {
+    flex: 1 1 130px;
+    min-width: 0;
+  }
+
+  .gen-file-meta .gen-file-name {
+    display: block;
+    overflow-wrap: anywhere;
+    color: var(--text-heading);
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .gen-file-meta .gen-file-name:hover {
+    color: var(--accent-hover);
+    text-decoration: underline;
+  }
+
+  .gen-file-sub {
+    display: block;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+  }
+
+  .gen-file-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    max-width: 100%;
+    margin-inline-start: auto;
+  }
+
+  .gen-file-actions :is(.gen-file-dl-btn, .gen-file-open-btn) {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-height: 32px;
+    padding: 0 7px;
+    border: var(--ui-border-hairline);
+    border-radius: var(--ui-radius-sm);
+    color: var(--text-primary);
+    font-size: 12px;
+    text-decoration: none;
+  }
+
+  .gen-file-actions :is(.gen-file-dl-btn, .gen-file-open-btn):hover {
+    background: var(--bg-surface);
+    color: var(--accent-hover);
+  }
+
+  .gen-file-dl-btn svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+  }
+
+  @media (max-width: 420px) {
+    .gen-file-card { flex-wrap: wrap; }
+  }
+
   #workspaceTabbar {
     box-sizing: border-box;
     height: 48px;
@@ -698,6 +884,22 @@
     color: var(--text-muted);
     padding-inline: 2px;
   }
+  #sidebar .sidebar-search-row .search-box:focus-within .kbd-hint,
+  #sidebar .sidebar-search-row:has(#newChatBtn[data-primary-action="project"]) .kbd-hint {
+    display: none;
+  }
+  #sidebar .sidebar-search-row .search-box:focus-within #searchInput,
+  #sidebar .sidebar-search-row:has(#newChatBtn[data-primary-action="project"]) #searchInput {
+    padding-inline-end: 10px;
+  }
+  @media (max-width: 1440px) {
+    #sidebar .sidebar-search-row .kbd-hint {
+      display: none;
+    }
+    #sidebar .sidebar-search-row #searchInput {
+      padding-inline-end: 10px;
+    }
+  }
   #sidebar .new-action-split {
     flex: 0 0 auto;
     height: 30px;
@@ -761,11 +963,157 @@
   #sidebarScroll .nav-item:hover:not(.active, .drop-above, .drop-below) {
     background-color: var(--bg-surface-hover);
   }
-  #sidebarScroll .proj-tree-header { padding-block: 3px; }
-  #sidebarScroll .proj-tree-header.has-badges { padding-block: 3px 4px; }
-  #sidebarScroll .proj-tree-group.is-selected-proj:not(.drop-proj-hover) > .proj-tree-header:not(.drop-folder-hover) {
+  #sidebarScroll .proj-tree-header,
+  #sidebarScroll .proj-tree-header.has-badges {
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: center;
+    min-height: 32px;
+    padding: 3px 5px 3px 4px;
+    box-sizing: border-box;
+  }
+  #sidebarScroll .proj-tree-head-top {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: center;
+    gap: 3.5px;
+    width: 100%;
+    min-width: 0;
+  }
+  #sidebarScroll .proj-tree-head-left {
+    gap: 3px;
+    min-width: 0;
+  }
+  #sidebarScroll .proj-drag-grip {
+    width: 9px;
+    flex-shrink: 0;
+  }
+  #sidebarScroll .proj-tree-chevron {
+    width: 11px;
+  }
+  #sidebarScroll .proj-tree-folder-ico,
+  #sidebarScroll .proj-tree-folder-ico svg {
+    width: 14px;
+    height: 14px;
+  }
+  #sidebarScroll .proj-tree-name {
+    flex: 0 1 auto;
+    min-width: 0;
+  }
+  #sidebarScroll .proj-self-hub-badge {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    font-size: 11px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  #sidebarScroll .proj-proc-pill {
+    height: 17px;
+    padding: 0 4px;
+    gap: 2px;
+    font-size: 9.8px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  #sidebarScroll .proj-tree-counters.proj-tree-badges-row {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: nowrap;
+    white-space: nowrap;
+    gap: 2px;
+    padding-left: 0;
+    padding-inline-start: 0;
+    width: auto;
+    min-width: 0;
+    flex-shrink: 0;
+  }
+  #sidebarScroll .proj-tree-counters > :is(.proj-count-running, .proj-count-done, .proj-count-stopped, .proj-count-err, .proj-count-queued, .proj-count-more) {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    height: 17px;
+    padding: 0 4px;
+    font-size: 9.8px;
+    line-height: 1;
+    white-space: nowrap;
+    box-sizing: border-box;
+    flex-shrink: 0;
+    font-variant-numeric: tabular-nums;
+  }
+  #sidebarScroll .proj-count-more {
+    font-family: var(--font-mono, "JetBrains Mono", ui-monospace, monospace);
+    font-weight: 600;
+    border-radius: 999px;
+    color: var(--text-muted);
+    background: color-mix(in srgb, var(--bg-surface-elevated) 75%, transparent);
+    border: 1px solid var(--border-subtle);
+  }
+  #sidebarScroll .proj-tree-group.is-selected-proj:not(.expanded, .drop-proj-hover) > .proj-tree-header:not(.drop-folder-hover) {
     border-color: transparent;
     background: var(--bg-surface-active);
+  }
+
+  #sidebarScroll .proj-tree-group.expanded {
+    --project-border-tint: 18%;
+    --project-header-tint: 6%;
+    --project-guide-tint: 38%;
+    border: 1px solid color-mix(in srgb, var(--proj-accent, var(--accent)) var(--project-border-tint), var(--border-subtle));
+    background: color-mix(in srgb, var(--bg-surface-elevated) 52%, transparent);
+    border-radius: var(--ui-radius-md);
+    padding-bottom: 4px;
+  }
+  html[data-theme="light"] #sidebarScroll .proj-tree-group.expanded { --project-border-tint: 24%; }
+  #sidebarScroll .proj-tree-group.expanded.has-active-chat {
+    --project-header-tint: 11%;
+    --project-guide-tint: 58%;
+  }
+  #sidebarScroll .proj-tree-group.expanded + .proj-tree-group,
+  #sidebarScroll .proj-tree-group + .proj-tree-group.expanded {
+    margin-top: 7px;
+  }
+  #sidebarScroll .proj-tree-group.expanded:not(.proj-drop-below) + .proj-tree-group:not(.proj-drop-above)::before {
+    display: none;
+  }
+  #sidebarScroll .proj-tree-group.expanded > .proj-tree-header {
+    --project-header-surface: var(--bg-surface-elevated);
+    border-bottom: 1px solid color-mix(in srgb, var(--proj-accent, var(--accent)) 14%, var(--border-subtle));
+    border-radius: calc(var(--ui-radius-md) - 1px) calc(var(--ui-radius-md) - 1px) 0 0;
+  }
+  #sidebarScroll .proj-tree-group.expanded:not(.drop-proj-hover) > .proj-tree-header:not(.drop-folder-hover) {
+    background: color-mix(in srgb, var(--proj-accent, var(--accent)) var(--project-header-tint), var(--project-header-surface));
+  }
+  #sidebarScroll .proj-tree-group.expanded > .proj-tree-header:hover,
+  #sidebarScroll .proj-tree-group.expanded.menu-open > .proj-tree-header {
+    --project-header-surface: var(--bg-surface-hover);
+  }
+  #sidebarScroll .proj-tree-group.expanded > .proj-tree-header .proj-tree-name {
+    font-size: 12.8px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    color: var(--text-heading);
+  }
+  #sidebarScroll .proj-tree-body {
+    margin: 4px 5px 3px 22px;
+    padding-inline-start: 9px;
+    border-inline-start: 1.5px solid color-mix(in srgb, var(--proj-accent, var(--accent)) var(--project-guide-tint, 38%), var(--border-subtle));
+  }
+  #sidebarScroll .proj-tree-body.drop-folder-hover {
+    border-inline-start-color: var(--proj-accent, var(--accent));
+  }
+  #sidebarScroll .proj-tree-body .nav-item {
+    min-height: 29px;
+    padding-block: 2px;
+    padding-inline: 6px 5px;
+  }
+  #sidebarScroll .proj-tree-body .nav-item-icon-btn { margin-inline-start: 4px; }
+  #sidebarScroll .proj-tree-body .nav-item:not(.active, .is-unread-done, .is-unread-stopped, .is-unread-error) .nav-item-title {
+    font-size: 12.5px;
+    font-weight: 460;
   }
 
   #sidebarScroll .proj-tree-head-right {
@@ -774,11 +1122,19 @@
     justify-items: end;
     flex-shrink: 0;
   }
-  #sidebarScroll :is(.proj-tree-quick-btns, .proj-count-idle) { grid-area: 1 / 1; }
+  #sidebarScroll :is(.proj-tree-quick-btns, .proj-tree-counters, .proj-count-idle) {
+    grid-area: 1 / 1;
+    justify-self: end;
+  }
   #sidebarScroll .proj-tree-quick-btns { display: inline-flex; }
   #sidebarScroll .proj-count-idle { display: inline; pointer-events: none; }
   #sidebarScroll .nav-item-more-btn { display: inline-flex; }
   #sidebarScroll .folder-group { position: relative; }
+  #foldersContainer .folder-group:not(.collapsed) > .nav-list {
+    margin: 3px 4px 3px 20px;
+    padding-inline-start: 8px;
+    border-inline-start: 1.5px solid var(--border-subtle);
+  }
   #sidebarScroll .folder-header-btn { padding-inline-end: 32px; }
   #sidebarScroll .folder-more-btn {
     position: absolute;
@@ -802,19 +1158,52 @@
       opacity: 0;
       pointer-events: none;
     }
-    #sidebarScroll .proj-tree-group:is(:focus-within, .menu-open, .is-selected-proj) > .proj-tree-header .proj-tree-quick-btns,
-    #sidebarScroll .proj-tree-header:hover .proj-tree-quick-btns,
+    #sidebarScroll .proj-tree-counters.proj-tree-badges-row {
+      opacity: 1;
+      pointer-events: auto;
+    }
+    #sidebarScroll .proj-tree-header:is(:hover, :focus-within) .proj-tree-quick-btns,
+    #sidebarScroll .proj-tree-group.menu-open > .proj-tree-header .proj-tree-quick-btns,
     #sidebarScroll .folder-group:is(:focus-within, .menu-open) > .folder-more-btn,
     #sidebarScroll .folder-header-btn:hover + .folder-more-btn,
     #sidebarScroll .folder-more-btn:hover {
       opacity: 1;
       pointer-events: auto;
     }
-    #sidebarScroll .proj-tree-group:is(:focus-within, .menu-open, .is-selected-proj) > .proj-tree-header .proj-count-idle,
-    #sidebarScroll .proj-tree-header:hover .proj-count-idle { opacity: 0; }
+    #sidebarScroll .proj-tree-header:is(:hover, :focus-within) :is(.proj-tree-counters, .proj-count-idle),
+    #sidebarScroll .proj-tree-group.menu-open > .proj-tree-header :is(.proj-tree-counters, .proj-count-idle) {
+      opacity: 0;
+      pointer-events: none;
+    }
   }
   @media (max-width: 860px), (hover: none), (pointer: coarse) {
-    #sidebarScroll .proj-count-idle { opacity: 0; }
+    #sidebarScroll .proj-tree-head-top { gap: 2.5px; }
+    #sidebarScroll .proj-tree-head-left { gap: 2px; }
+    #sidebarScroll .proj-drag-grip { width: 7px; }
+    #sidebarScroll .proj-tree-chevron { width: 10px; }
+    #sidebarScroll .proj-tree-folder-ico,
+    #sidebarScroll .proj-tree-folder-ico svg { width: 13px; height: 13px; }
+    #sidebarScroll .proj-proc-pill {
+      padding: 0 3.5px;
+      font-size: 9.2px;
+    }
+    #sidebarScroll .proj-tree-counters.proj-tree-badges-row { gap: 1.5px; }
+    #sidebarScroll .proj-tree-counters > :is(.proj-count-running, .proj-count-done, .proj-count-stopped, .proj-count-err, .proj-count-queued, .proj-count-more) {
+      padding: 0 3px;
+      font-size: 9.2px;
+    }
+    #sidebarScroll .proj-tree-head-right {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      flex-wrap: nowrap;
+    }
+    #sidebarScroll .proj-tree-quick-btns { gap: 1px; }
+    #sidebarScroll :is(.proj-inline-more-btn, .proj-inline-mem-btn, .proj-inline-new-btn) {
+      width: 22px;
+      height: 22px;
+    }
+    #sidebarScroll .proj-count-idle { display: none; }
   }
 
   #sidebarActivitySection.activity-radar-section {
@@ -907,20 +1296,172 @@
     outline: 1px solid var(--border-focus);
     outline-offset: -1px;
   }
-  @media (max-width: 860px) {
-    #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) .sidebar-telemetry-pod { display: none; }
-    #mobileTelemetryBar { padding: 0; gap: 2px; }
-    #mobileTelemetryBar .mob-telem-pill {
-      height: 27px;
-      padding-inline: 5px;
-      border-color: transparent;
-      background: transparent;
-    }
-    #mobileTelemetryBar .mob-telem-expand-btn {
-      border: 0;
-      background: transparent;
-    }
-    #mobileTelemetryBar :is(.mob-telem-pill, .mob-telem-expand-btn):hover { background: var(--bg-surface-hover); }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) .sidebar-telemetry-pod {
+    display: none;
+  }
+  #sidebar #mobileTelemetryBar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 26px;
+    align-items: center;
+    gap: 3px;
+    padding: 0;
+    width: 100%;
+    min-width: 0;
+    height: auto;
+    overflow: hidden;
+    box-sizing: border-box;
+  }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) #mobileTelemetryBar[data-configured-count="1"] {
+    grid-template-columns: minmax(0, 1fr) 26px;
+  }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) #mobileTelemetryBar[data-configured-count="2"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 26px;
+  }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) #mobileTelemetryBar:is([data-configured-count="3"], [data-configured-count="4"]) {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 26px;
+    gap: 2px 3px;
+  }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) #mobileTelemetryBar .mob-telem-pill:not(#mobQuotaPillBtn, .is-configured) {
+    display: none;
+  }
+  #sidebar #mobileTelemetryBar .mob-telem-pill {
+    appearance: none;
+    -webkit-appearance: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    width: 100%;
+    max-width: none;
+    min-width: 0;
+    height: 28px;
+    padding: 0 6px;
+    border: var(--ui-border-hairline);
+    border-radius: var(--ui-radius-sm);
+    background: color-mix(in srgb, var(--bg-surface-elevated) 55%, transparent);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: 10.5px;
+    font-weight: 560;
+    line-height: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    cursor: pointer;
+    box-sizing: border-box;
+  }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) #mobileTelemetryBar:is([data-configured-count="3"], [data-configured-count="4"]) .mob-telem-pill {
+    height: 26px;
+  }
+  #sidebar #mobileTelemetryBar .mob-telem-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  #sidebar #mobileTelemetryBar .mob-telem-dot {
+    width: 6.5px;
+    height: 6.5px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--status-emerald);
+  }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.level-ok { background: var(--status-emerald); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot:is(.level-warn, .is-paused) { background: var(--status-amber); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot:is(.level-high, .level-low, .is-low) { background: var(--status-red); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-or { background: #a855f7; }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-or.is-paused { background: var(--status-amber); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-or.is-low { background: var(--status-red); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-or.is-unconfigured { background: color-mix(in srgb, #a855f7 55%, var(--text-muted)); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-cgpt { background: var(--status-emerald); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-cgpt.is-paused { background: var(--status-amber); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-cgpt.level-warn { background: var(--status-amber); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-cgpt.level-low { background: var(--status-red); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot.is-cgpt.is-unconfigured { background: color-mix(in srgb, var(--accent) 45%, var(--text-muted)); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot:is(.is-claude, .is-claude-code) { background: var(--claude-code-accent, #d97757); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot:is(.is-claude, .is-claude-code).is-paused { background: var(--status-amber); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot:is(.is-claude, .is-claude-code).level-warn { background: var(--status-amber); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot:is(.is-claude, .is-claude-code).level-low { background: var(--status-red); }
+  #sidebar #mobileTelemetryBar .mob-telem-dot:is(.is-claude, .is-claude-code).is-unconfigured { background: color-mix(in srgb, var(--claude-code-accent, #d97757) 45%, var(--text-muted)); }
+  #sidebar #mobileTelemetryBar .mob-telem-pill.is-low .mob-telem-text {
+    color: var(--status-red);
+    font-weight: 650;
+  }
+  #sidebar #mobileTelemetryBar .mob-telem-pill.is-warn .mob-telem-text {
+    color: var(--status-amber);
+  }
+  #sidebar #mobileTelemetryBar .mob-telem-expand-btn {
+    appearance: none;
+    -webkit-appearance: none;
+    grid-column: 2;
+    grid-row: 1;
+    align-self: center;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 28px;
+    min-height: 28px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--ui-radius-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 11px;
+    line-height: 1;
+    flex-shrink: 0;
+    cursor: pointer;
+    box-sizing: border-box;
+  }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) #mobileTelemetryBar[data-configured-count="2"] .mob-telem-expand-btn {
+    grid-column: 3;
+    grid-row: 1;
+  }
+  #sidebar .sidebar-footer:not(.is-mob-telemetry-expanded) #mobileTelemetryBar:is([data-configured-count="3"], [data-configured-count="4"]) .mob-telem-expand-btn {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+    height: 100%;
+    min-height: 26px;
+  }
+  #sidebar #mobileTelemetryBar :is(.mob-telem-pill, .mob-telem-expand-btn):hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
+  }
+  #sidebar .sidebar-footer.is-mob-telemetry-expanded #mobileTelemetryBar {
+    order: -1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    height: 22px;
+    min-height: 22px;
+    padding: 0 6px;
+    gap: 6px;
+  }
+  #sidebar .sidebar-footer.is-mob-telemetry-expanded #mobileTelemetryBar::before {
+    content: "Лимиты и квоты";
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+  }
+  #sidebar .sidebar-footer.is-mob-telemetry-expanded #mobileTelemetryBar .mob-telem-pill {
+    display: none;
+  }
+  #sidebar .sidebar-footer.is-mob-telemetry-expanded #mobileTelemetryBar .mob-telem-expand-btn {
+    grid-column: auto;
+    grid-row: auto;
+    width: 22px;
+    height: 22px;
+    min-height: 22px;
+    background: transparent;
+  }
+  #sidebar .sidebar-footer.is-mob-telemetry-expanded #mobileTelemetryBar .mob-telem-expand-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-primary);
   }
 
   :is(#chatContextMenu, #projectContextMenu).ui-popover {
@@ -947,6 +1488,15 @@
 
 
   /* Dialogs and mobile sheets */
+  .modal-backdrop {
+    z-index: var(--z-modal);
+  }
+  #modesHelpModal {
+    z-index: calc(var(--z-modal) + 10);
+  }
+  .modal-backdrop.media-lightbox {
+    z-index: 1200;
+  }
   .modal-backdrop:has(> .modal-card) {
     align-items: center;
     justify-content: center;
@@ -2172,7 +2722,7 @@
   }
 
   #agyConfirmModal.agy-confirm-backdrop {
-    z-index: calc(var(--z-modal) + 30);
+    z-index: 1300;
   }
   #agyConfirmModal > .agy-confirm-card {
     width: min(100%, 400px);
@@ -3634,6 +4184,36 @@
     }
     .proj-env-footer > #saveProjEnvBtn {
       width: 100%;
+    }
+  }
+
+  /* Turn generation duration telemetry & live stopwatch (v167) */
+  .usage-hint {
+    font-variant-numeric: tabular-nums;
+  }
+  .usage-hint .usage-dur-short {
+    display: none;
+  }
+  .assistant-header > .msg-live-elapsed {
+    font-family: var(--font-mono, "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace);
+    font-size: 11px;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-muted);
+    opacity: 0.72;
+    white-space: nowrap;
+    flex-shrink: 0;
+    margin-left: auto;
+  }
+  .assistant-header > .msg-time-tag ~ .msg-live-elapsed {
+    margin-left: 6px;
+  }
+  @media (max-width: 480px) {
+    .usage-hint .usage-dur-full {
+      display: none;
+    }
+    .usage-hint .usage-dur-short {
+      display: inline;
     }
   }
 }

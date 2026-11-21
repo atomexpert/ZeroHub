@@ -39,6 +39,30 @@ PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 STILL_ACTIVE = 259
 
 _SERVICE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.\-]{1,48}$")
+_BANNER_URL_CREDS_RE = re.compile(r"([a-zA-Z][a-zA-Z0-9+.\-]*://)([^/\s:@]*):([^/\s@]+)@")
+_BANNER_LONG_FLAG_SECRET_RE = re.compile(
+    r"""(?<!\S)(--[A-Za-z0-9_-]*(?:token|api[-_]?key|password|passwd|secret)(?:\s+|=))(?:"[^"]*"|'[^']*'|[^\s;&|]+)""",
+    re.IGNORECASE,
+)
+_BANNER_SHORT_P_SECRET_RE = re.compile(
+    r"""(?<!\S)(-p(?:\s+|=))(?:"[^"]*"|'[^']*'|[^\s;&|]+)"""
+)
+_BANNER_ENV_ASSIGN_SECRET_RE = re.compile(
+    r"""(?<![A-Za-z0-9_-])([A-Za-z0-9_]*(?:_KEY|_TOKEN|_SECRET|_PASSWORD|_PASSWD|API_KEY|TOKEN|SECRET|PASSWORD)\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s;&|]+)""",
+    re.IGNORECASE,
+)
+_BANNER_BEARER_RE = re.compile(r"""(\bBearer\s+)[^\s"']+""", re.IGNORECASE)
+
+
+def _redact_cmd_for_banner(cmd: str) -> str:
+    """Mask sensitive CLI flags, inline env assignments and URL credentials before logging."""
+    redacted = str(cmd or "")
+    redacted = _BANNER_URL_CREDS_RE.sub(r"\1\2:<redacted>@", redacted)
+    redacted = _BANNER_LONG_FLAG_SECRET_RE.sub(r"\1<redacted>", redacted)
+    redacted = _BANNER_SHORT_P_SECRET_RE.sub(r"\1<redacted>", redacted)
+    redacted = _BANNER_ENV_ASSIGN_SECRET_RE.sub(r"\1<redacted>", redacted)
+    redacted = _BANNER_BEARER_RE.sub(r"\1<redacted>", redacted)
+    return redacted
 _PROTECTED_ENV_KEYS = {
     "SYSTEMROOT",
     "WINDIR",
@@ -628,6 +652,7 @@ class HostServiceManager:
         self._pending_transitions: list[dict[str, Any]] = []
         self._change_listeners: list[Callable[..., Awaitable[None]]] = []
         self._transition_listeners: list[Callable[[dict[str, Any]], Awaitable[None]]] = []
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
 
     def add_change_listener(self, cb: Callable[..., Awaitable[None]]) -> None:
         if cb not in self._change_listeners:
@@ -656,7 +681,9 @@ class HostServiceManager:
                     coro = cb(project_name, proj_path)
                 except TypeError:
                     coro = cb(project_name)
-                loop.create_task(coro)
+                task = loop.create_task(coro)
+                self._bg_tasks.add(task)
+                task.add_done_callback(self._bg_tasks.discard)
             except Exception:
                 pass
 
@@ -1684,7 +1711,7 @@ class HostServiceManager:
         rel_wd_banner = _relativize_workdir_for_guest(str(resolved_wd), proj_res)
 
         banner = (
-            f"\n=== [{now_iso}] START {clean_proj}/{clean_name} | cmd: {eff_cmd} | "
+            f"\n=== [{now_iso}] START {clean_proj}/{clean_name} | cmd: {_redact_cmd_for_banner(eff_cmd)} | "
             f"cwd: {rel_wd_banner} | gpu: {'on' if eff_allow_gpu else 'off'} ===\n"
         )
         popen_kwargs: dict[str, Any] = dict(config.subprocess_hidden_kwargs())

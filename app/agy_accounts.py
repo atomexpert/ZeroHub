@@ -116,9 +116,12 @@ async def refresh_and_build_agy_token_payload(payload, *, account_id=None, proxy
                 **({'scope': token['scope']} if token.get('scope') else {}), expiry=datetime.fromtimestamp(datetime.now(timezone.utc).timestamp()+token.get('expires_in',3600), timezone.utc).isoformat()),
                 auth_method=payload.get('auth_method') or 'consumer', id_token=token.get('id_token') or payload.get('id_token',''), id_token_email=email, email=email)
         except urllib.error.HTTPError as exc:
-            if exc.code >= 500 or exc.code == 429:
-                raise OAuthTemporaryError('Google OAuth temporarily unavailable') from None
-            raise ValueError('Google OAuth refresh rejected') from None
+            try:
+                if exc.code >= 500 or exc.code == 429:
+                    raise OAuthTemporaryError('Google OAuth temporarily unavailable') from None
+                raise ValueError('Google OAuth refresh rejected') from None
+            finally:
+                exc.close()
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             raise OAuthTemporaryError('Google OAuth temporarily unavailable') from None
         except Exception:
@@ -126,49 +129,88 @@ async def refresh_and_build_agy_token_payload(payload, *, account_id=None, proxy
     return await asyncio.to_thread(request)
 
 
+_ACCOUNT_REFRESH_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def _get_account_refresh_lock(key: str) -> asyncio.Lock:
+    clean_k = str(key or '').strip() or '_host'
+    lock = _ACCOUNT_REFRESH_LOCKS.get(clean_k)
+    try:
+        cur_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        cur_loop = None
+    if lock is None or (
+        cur_loop is not None
+        and getattr(lock, '_loop', None) not in (None, cur_loop)
+    ):
+        lock = asyncio.Lock()
+        _ACCOUNT_REFRESH_LOCKS[clean_k] = lock
+    return lock
+
+
 async def refresh_host_agy_token(home, *, force=False):
     from .agy_credentials import WindowsCredentialStore, _lease_lock
-    async with _lease_lock:
-        path = Path(home) / '.gemini/antigravity-cli/antigravity-oauth-token'
-        store = WindowsCredentialStore() if os.name == 'nt' else None
-        entry = store.read() if store else None
-        raw = None
-        if entry:
-            for encoding in ('utf-8', 'utf-16-le'):
+    path = Path(home) / '.gemini/antigravity-cli/antigravity-oauth-token'
+    try:
+        lock_key = os.path.normcase(str(path.resolve()))
+    except OSError:
+        lock_key = str(path)
+
+    async with _get_account_refresh_lock(lock_key):
+        async with _lease_lock:
+            store = WindowsCredentialStore() if os.name == 'nt' else None
+            entry = store.read() if store else None
+            raw = None
+            if entry:
+                for encoding in ('utf-8', 'utf-16-le'):
+                    try:
+                        raw = json.loads(bytes.fromhex(entry['blob']).decode(encoding))
+                        break
+                    except (ValueError, UnicodeError):
+                        pass
+            if raw is None:
                 try:
-                    raw = json.loads(bytes.fromhex(entry['blob']).decode(encoding))
-                    break
-                except (ValueError, UnicodeError):
-                    pass
-        if raw is None:
-            try:
-                raw = json.loads(path.read_text(encoding='utf-8'))
-            except (OSError, ValueError):
+                    raw = json.loads(path.read_text(encoding='utf-8'))
+                except (OSError, ValueError):
+                    if force:
+                        raise ValueError('No refreshable Google OAuth session') from None
+                    return
+            token = raw.get('token', raw)
+            if not token.get('refresh_token'):
                 if force:
-                    raise ValueError('No refreshable Google OAuth session') from None
+                    raise ValueError('No Google refresh token')
                 return
-        token = raw.get('token', raw)
-        if not token.get('refresh_token'):
-            if force:
-                raise ValueError('No Google refresh token')
-            return
-        remaining = 0
-        try:
-            dt = datetime.fromisoformat(str(token.get('expiry')).replace('Z', '+00:00'))
-            remaining = (dt.replace(tzinfo=dt.tzinfo or timezone.utc) - datetime.now(timezone.utc)).total_seconds()
-        except (ValueError, TypeError):
-            pass
-        if force or not token.get('access_token') or remaining < 900:
+            remaining = 0
             try:
-                fresh = await refresh_and_build_agy_token_payload({**raw, **token})
-            except (OAuthTemporaryError, TimeoutError):
-                if force or remaining <= 60:
-                    raise
+                dt = datetime.fromisoformat(str(token.get('expiry')).replace('Z', '+00:00'))
+                remaining = (dt.replace(tzinfo=dt.tzinfo or timezone.utc) - datetime.now(timezone.utc)).total_seconds()
+            except (ValueError, TypeError):
+                pass
+            if not (force or not token.get('access_token') or remaining < 900):
                 return
-            text = json.dumps(fresh, ensure_ascii=False)
+            refresh_input = {**raw, **token}
+            had_store_entry = entry is not None
+            had_file = path.is_file()
+
+        try:
+            fresh = await refresh_and_build_agy_token_payload(refresh_input)
+        except (OAuthTemporaryError, TimeoutError):
+            if force or remaining <= 60:
+                raise
+            return
+
+        text = json.dumps(fresh, ensure_ascii=False)
+        async with _lease_lock:
+            cur_entry = store.read() if store else None
+            cur_file_exists = path.is_file()
+            # Guard against reviving credentials if the account/session was deleted while refreshing.
+            if (had_store_entry and cur_entry is None and not cur_file_exists) or (
+                not had_store_entry and had_file and not cur_file_exists and cur_entry is None
+            ):
+                return
             config._atomic_sync_text_file(path, text)
             if store:
-                store.write({**(entry or {}), 'blob': text.encode('utf-8').hex()})
+                store.write({**(cur_entry or entry or {}), 'blob': text.encode('utf-8').hex()})
 
 
 async def materialize_agy_account_home(account, user='admin', *, force_refresh=False):
@@ -498,9 +540,12 @@ async def exchange_agy_oauth_code_for_token(
         except ValueError:
             raise
         except urllib.error.HTTPError as exc:
-            if exc.code >= 500 or exc.code == 429:
-                raise OAuthTemporaryError('Сервер Google OAuth временно недоступен. Попробуйте через несколько секунд.') from None
-            raise ValueError('Код авторизации Google недействителен или уже был использован.') from None
+            try:
+                if exc.code >= 500 or exc.code == 429:
+                    raise OAuthTemporaryError('Сервер Google OAuth временно недоступен. Попробуйте через несколько секунд.') from None
+                raise ValueError('Код авторизации Google недействителен или уже был использован.') from None
+            finally:
+                exc.close()
         except (urllib.error.URLError, TimeoutError, ConnectionError):
             raise OAuthTemporaryError('Не удалось связаться с Google OAuth через выбранный маршрут прокси.') from None
         except Exception:

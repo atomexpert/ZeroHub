@@ -129,7 +129,25 @@
 
   const initialVoicePrefs = migrateAndLoadVoicePrefs();
 
+  const NOTIFICATION_CHECKBOXES = {
+    in_app_toast: "notifInAppToastChk",
+    system_push: "notifSystemPushChk",
+    sound: "notifSoundChk",
+    on_turn_done: "notifOnTurnDoneChk",
+    on_turn_error: "notifOnTurnErrorChk",
+    on_process_crash: "notifOnProcessCrashChk",
+    only_long_turns: "notifOnlyLongTurnsChk",
+  };
+  const NOTIFICATION_DEFAULTS = {
+    in_app_toast: true, system_push: true, sound: false, on_turn_done: true,
+    on_turn_error: true, on_process_crash: true, only_long_turns: false,
+  };
   const state = {
+    notifications: {
+      prefs: { ...NOTIFICATION_DEFAULTS }, userKey: "", prefsRevision: 0,
+      subscriptions: [], vapidPublicKey: "", currentSubId: "", currentDevicePushActive: false,
+      busy: false, loaded: false,
+    },
     settingsActiveTab: localStorage.getItem("agy_hub_settings_tab") || "appearance",
     themeMode:
       localStorage.getItem("agy_hub_theme_mode") ||
@@ -197,6 +215,7 @@
     handoffDismissedTargets: new Map(),
     deletedChatIds: new Set(),
     activitySectionCollapsed: false,
+    telemetryDockMode: "auto",
     mobTelemetryExpanded: false,
     justFinishedChats: new Map(),
     justFinishedHeaderTimer: null,
@@ -649,6 +668,7 @@
       voiceWs: null,
       wsConnected: false,
       wsReconnectTimer: null,
+      wsReconnectAttempts: 0,
       micStream: null,
       micAudioCtx: null,
       micAnalyser: null,
@@ -677,6 +697,10 @@
       startTime: 0,
       timerId: null,
       rafId: null,
+      canvasCssW: 132,
+      canvasCssH: 28,
+      canvasResizeObserver: null,
+      canvasResizeHandler: null,
       waveBars: null,
       waveTargets: null,
       utteranceSendChain: Promise.resolve(),
@@ -1044,6 +1068,22 @@
     settingsModal: $("settingsModal"),
     settingsModalVerBadge: $("settingsModalVerBadge"),
     settingsTabsBar: $("settingsTabsBar"),
+    settingsNotificationsCard: $("settingsNotificationsCard"),
+    notifHeading: $("notifHeading"),
+    notifStatusPill: $("notifStatusPill"),
+    notifDevicePushBar: $("notifDevicePushBar"),
+    notifTogglePushBtn: $("notifTogglePushBtn"),
+    notifTestPushBtn: $("notifTestPushBtn"),
+    notifTestSoundBtn: $("notifTestSoundBtn"),
+    notifDeviceHint: $("notifDeviceHint"),
+    notifDevicesList: $("notifDevicesList"),
+    notifInAppToastChk: $("notifInAppToastChk"),
+    notifSystemPushChk: $("notifSystemPushChk"),
+    notifSoundChk: $("notifSoundChk"),
+    notifOnTurnDoneChk: $("notifOnTurnDoneChk"),
+    notifOnTurnErrorChk: $("notifOnTurnErrorChk"),
+    notifOnProcessCrashChk: $("notifOnProcessCrashChk"),
+    notifOnlyLongTurnsChk: $("notifOnlyLongTurnsChk"),
     settingsTabAppearanceBtn: $("settingsTabAppearanceBtn"),
     settingsTabAiBtn: $("settingsTabAiBtn"),
     settingsTabServerBtn: $("settingsTabServerBtn"),
@@ -1681,6 +1721,7 @@
   function showToast(text, duration = 2600, action = null) {
     const t = document.createElement("div");
     t.className = action && action.label ? "toast has-action" : "toast";
+    if (["done", "warn", "error"].includes(action?.tone)) t.classList.add("is-" + action.tone);
     const span = document.createElement("span");
     span.className = "toast-text";
     span.textContent = text;
@@ -1771,6 +1812,7 @@
   const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|svg|avif|bmp|ico)$/i;
   const VIDEO_EXT_RE = /\.(mp4|webm|mov|m4v)$/i;
   const AUDIO_EXT_RE = /\.(mp3|wav|ogg|m4a|flac)$/i;
+  const DELIVERABLE_FILE_EXT_RE = /\.(apk|aab|ipa|exe|msi|msix|dmg|pkg|deb|rpm|appimage|zip|7z|rar|tar|gz|tgz|bz2|xz|zst|iso|whl|pdf|docx?|xlsx?|pptx?|odt|ods|epub|rtf|csv|tsv|parquet)$/i;
 
   let activeMarkdownMediaTracker = null;
 
@@ -1788,11 +1830,9 @@
 
     const hashIdx = trimmed.indexOf("#");
     const fragment = hashIdx >= 0 ? trimmed.slice(hashIdx) : "";
-    let body = hashIdx >= 0 ? trimmed.slice(0, hashIdx) : trimmed;
+    let body = trimmed.split(/[?#]/, 1)[0];
 
     if (isFileScheme) {
-      const qIdx = body.indexOf("?");
-      if (qIdx >= 0) body = body.slice(0, qIdx);
       body = body.replace(/^file:\/\//i, "");
       if (/^\/+[a-zA-Z]:[\\/]/.test(body)) {
         body = body.replace(/^\/+/, "");
@@ -1821,6 +1861,128 @@
       fragment,
       hasLineAnchor,
     };
+  }
+
+  const CHAT_UPLOAD_PATH_RE = /(?:^|\/)(?:users\/[^/]+\/uploads|data\/uploads|_uploads\/[^/]+|sandbox_uploads)\//;
+  const CHAT_UPLOAD_URL_RE = /^(?:https?:\/\/[^/]+)?\/?api\/uploads\//;
+
+  function chatUploadRefPath(value) {
+    if (typeof value !== "string") return "";
+    let path = value.trim().split(/[?#]/, 1)[0];
+    try { path = decodeURIComponent(path); } catch {}
+    return path.replace(/\\/g, "/").replace(/^file:\/\//i, "")
+      .replace(/^\/+(?=[a-z]:\/)/i, "");
+  }
+
+  function chatUploadRefKey(value) {
+    return chatUploadRefPath(value).toLowerCase();
+  }
+
+  const userUploadRefIndexCache = {
+    messagesRef: null,
+    messagesLen: -1,
+    firstMsgRef: null,
+    lastMsgRef: null,
+    prevLastMsgRef: null,
+    lastUserMsgRef: null,
+    lastUserAttLen: -1,
+    pendingRef: null,
+    pendingLen: -1,
+    firstPendingRef: null,
+    lastPendingRef: null,
+    keys: new Set(),
+  };
+
+  function getUserChatUploadKeySet() {
+    const msgs = Array.isArray(state.messages) ? state.messages : null;
+    const pending = Array.isArray(state.pendingAttachments) ? state.pendingAttachments : null;
+    const mLen = msgs ? msgs.length : 0;
+    const pLen = pending ? pending.length : 0;
+    const firstMsg = mLen > 0 ? msgs[0] : null;
+    const lastMsg = mLen > 0 ? msgs[mLen - 1] : null;
+    const prevLastMsg = mLen > 1 ? msgs[mLen - 2] : null;
+    const firstPending = pLen > 0 ? pending[0] : null;
+    const lastPending = pLen > 0 ? pending[pLen - 1] : null;
+    const cachedLastUserAttLen = Array.isArray(userUploadRefIndexCache.lastUserMsgRef?.attachments)
+      ? userUploadRefIndexCache.lastUserMsgRef.attachments.length
+      : -1;
+
+    if (
+      userUploadRefIndexCache.messagesRef === msgs &&
+      userUploadRefIndexCache.messagesLen === mLen &&
+      userUploadRefIndexCache.firstMsgRef === firstMsg &&
+      userUploadRefIndexCache.lastMsgRef === lastMsg &&
+      userUploadRefIndexCache.prevLastMsgRef === prevLastMsg &&
+      userUploadRefIndexCache.lastUserAttLen === cachedLastUserAttLen &&
+      userUploadRefIndexCache.pendingRef === pending &&
+      userUploadRefIndexCache.pendingLen === pLen &&
+      userUploadRefIndexCache.firstPendingRef === firstPending &&
+      userUploadRefIndexCache.lastPendingRef === lastPending
+    ) {
+      return userUploadRefIndexCache.keys;
+    }
+
+    const nextKeys = new Set();
+    const addAttachment = (attachment) => {
+      if (!attachment) return;
+      const diskKey = chatUploadRefKey(attachment.disk_path);
+      if (diskKey) nextKeys.add(diskKey);
+      const urlKey = chatUploadRefKey(attachment.url);
+      if (urlKey) nextKeys.add(urlKey);
+    };
+
+    if (pending) {
+      for (let i = 0; i < pLen; i++) {
+        addAttachment(pending[i]);
+      }
+    }
+
+    let lastUserMsg = null;
+    if (msgs) {
+      for (let i = 0; i < mLen; i++) {
+        const message = msgs[i];
+        if (message?.role === "user") {
+          lastUserMsg = message;
+          if (Array.isArray(message.attachments)) {
+            for (let j = 0; j < message.attachments.length; j++) {
+              addAttachment(message.attachments[j]);
+            }
+          }
+        }
+      }
+    }
+
+    userUploadRefIndexCache.messagesRef = msgs;
+    userUploadRefIndexCache.messagesLen = mLen;
+    userUploadRefIndexCache.firstMsgRef = firstMsg;
+    userUploadRefIndexCache.lastMsgRef = lastMsg;
+    userUploadRefIndexCache.prevLastMsgRef = prevLastMsg;
+    userUploadRefIndexCache.lastUserMsgRef = lastUserMsg;
+    userUploadRefIndexCache.lastUserAttLen = Array.isArray(lastUserMsg?.attachments)
+      ? lastUserMsg.attachments.length
+      : -1;
+    userUploadRefIndexCache.pendingRef = pending;
+    userUploadRefIndexCache.pendingLen = pLen;
+    userUploadRefIndexCache.firstPendingRef = firstPending;
+    userUploadRefIndexCache.lastPendingRef = lastPending;
+    userUploadRefIndexCache.keys = nextKeys;
+    return nextKeys;
+  }
+
+  function isUserChatUploadMediaRef(localRef, rawHref = "") {
+    const keys = new Set([chatUploadRefKey(rawHref), chatUploadRefKey(localRef?.cleanPath)]);
+    keys.delete("");
+    for (const key of keys) {
+      if (CHAT_UPLOAD_PATH_RE.test(key) || CHAT_UPLOAD_URL_RE.test(key)) return true;
+    }
+    if (!keys.size) return false;
+
+    const uploadKeySet = getUserChatUploadKeySet();
+    if (!uploadKeySet.size) return false;
+    for (const key of keys) {
+      if (uploadKeySet.has(key)) return true;
+    }
+    return false;
   }
 
   function buildHubMediaUrl(cleanPath, { download = false } = {}) {
@@ -1862,15 +2024,85 @@
       parts[i] = parts[i].replace(
         /(\]\()((?:file:\/\/|\/?[a-zA-Z]:[\\/]|\/workspace\/)[^)\r\n]+)(\))/gi,
         (_m, open, rawTarget, close) => {
-          const cleaned = rawTarget.trim().replace(/\\/g, "/").replace(/ /g, "%20");
-          return `${open}${cleaned}${close}`;
+          const target = rawTarget.trim();
+          const title = target.match(/\s+(?:"[^"]*"|'[^']*')$/)?.[0] || "";
+          const path = target.slice(0, target.length - title.length);
+          const cleaned = path.replace(/\\/g, "/").replace(/ /g, "%20");
+          return `${open}${cleaned}${title}${close}`;
         }
       );
     }
     return parts.join("");
   }
 
+  function renderHubMediaLink({ kind, srcUrl, dlUrl, basename, caption, title, labelHtml }) {
+    const titleAttr = ` title="${escapeHtml(title || basename)}"`;
+    if (kind === "image") {
+      const src = escapeHtml(srcUrl);
+      return `<a href="${src}" target="_blank" rel="noopener" class="hub-media-link" data-lightbox-src="${src}" data-lightbox-dl="${escapeHtml(dlUrl)}" data-lightbox-caption="${escapeHtml(caption)}"${titleAttr}>${labelHtml}</a>`;
+    }
+    return `<a href="${escapeHtml(dlUrl)}" download="${escapeHtml(basename)}" class="hub-media-link"${titleAttr}>${labelHtml}</a>`;
+  }
+
+  function resolveMarkdownMediaUrls(localRef, rawHref, userUpload) {
+    // Bare POSIX upload paths are also accepted by the authenticated media endpoint.
+    const bareUploadPath = userUpload && /^\/(?!\/|api\/)/i.test(rawHref)
+      && CHAT_UPLOAD_PATH_RE.test(chatUploadRefKey(rawHref));
+    const path = localRef?.cleanPath || (bareUploadPath ? chatUploadRefPath(rawHref) : "");
+    if (path) return { srcUrl: buildHubMediaUrl(path), dlUrl: buildHubMediaUrl(path, { download: true }) };
+    let href = /^api\/uploads\//i.test(rawHref) ? "/" + rawHref : rawHref;
+    if (userUpload && /^https?:\/\//i.test(href)) {
+      try {
+        const url = new URL(href);
+        if (url.origin === window.location.origin) href = url.pathname + url.search;
+      } catch {}
+    }
+    return { srcUrl: withMediaToken(href), dlUrl: withMediaToken(href, { download: true }) };
+  }
+
+  function describeDeliverableFile(basename, caption, titleText) {
+    const ext = /\.([a-z0-9]+)$/i.exec(basename)?.[1].toLowerCase() || "";
+    const extLabel = ext.slice(0, 5).toUpperCase() || "ФАЙЛ";
+    const isPdf = ext === "pdf";
+    let subtitle = [caption, titleText].map(text => text?.trim())
+      .find(text => text && text.toLowerCase() !== basename.toLowerCase());
+    if (!subtitle) {
+      if (ext === "apk") subtitle = "Пакет Android";
+      else if (/^(aab|ipa|exe|msi|msix|dmg|pkg|deb|rpm|appimage)$/.test(ext)) subtitle = "Установочный пакет";
+      else if (/^(zip|7z|rar|tar|gz|tgz|bz2|xz|zst|whl)$/.test(ext)) subtitle = "Архив";
+      else if (isPdf) subtitle = "Документ PDF";
+      else if (/^(docx?|pptx?|odt|epub|rtf)$/.test(ext)) subtitle = "Документ";
+      else if (/^(xlsx?|ods|csv|tsv|parquet)$/.test(ext)) subtitle = "Таблица";
+      else subtitle = "Файл";
+    }
+    return { extLabel, isPdf, subtitle };
+  }
+
+  function renderGeneratedFileCard({ srcUrl, dlUrl, caption, basename, titleText }) {
+    const filename = basename || "Файл";
+    const { extLabel, isPdf, subtitle } = describeDeliverableFile(filename, caption, titleText);
+    const safeSrc = escapeHtml(srcUrl);
+    const safeDl = escapeHtml(dlUrl || srcUrl);
+    const safeBase = escapeHtml(filename);
+    return `
+      <span class="gen-file-card">
+        <span class="gen-file-badge"><span class="gen-file-ext">${extLabel}</span></span>
+        <span class="gen-file-meta">
+          <a href="${safeDl}" download="${safeBase}" class="gen-file-name">${safeBase}</a>
+          <span class="gen-file-sub">${escapeHtml(subtitle)}</span>
+        </span>
+        <span class="gen-file-actions">
+          ${isPdf ? `<a href="${safeSrc}" target="_blank" rel="noopener" class="gen-file-open-btn">Открыть</a>` : ""}
+          <a href="${safeDl}" download="${safeBase}" class="gen-file-dl-btn">${SVG.download}<span>Скачать</span></a>
+        </span>
+      </span>
+    `;
+  }
+
   function renderGeneratedMediaCard({ kind, srcUrl, dlUrl, caption, basename, titleText = "" }) {
+    if (kind === "file") {
+      return renderGeneratedFileCard({ srcUrl, dlUrl, caption, basename, titleText });
+    }
     const safeSrc = escapeHtml(srcUrl);
     const safeDl = escapeHtml(dlUrl || srcUrl);
     const safeBase = escapeHtml(basename || "media");
@@ -1922,6 +2154,7 @@
 
   function openMediaLightbox({ src, dl, caption }) {
     if (!els.mediaLightboxModal || !els.lightboxImg || !src) return;
+    hideMsgSelectionToolbar();
     els.lightboxImg.src = src;
     els.lightboxImg.alt = caption || "Изображение";
     if (els.lightboxCaption) {
@@ -1936,7 +2169,76 @@
     els.mediaLightboxModal.classList.remove("hidden");
   }
 
+  function isSafeExternalHref(rawHref) {
+    if (typeof rawHref !== "string") return false;
+    // Strip ASCII control characters (browsers ignore tabs/newlines inside schemes like "java\tscript:")
+    const cleaned = rawHref.replace(/[\u0000-\u001f\u007f]+/g, "").trim();
+    if (!cleaned) return false;
+    if (
+      cleaned.startsWith("#") ||
+      cleaned.startsWith("./") ||
+      cleaned.startsWith("../") ||
+      (cleaned.startsWith("/") && !cleaned.startsWith("//"))
+    ) {
+      return true;
+    }
+    return /^(?:https?:|mailto:)/i.test(cleaned);
+  }
+
+  function isUnclosedFencedCodeToken(token) {
+    if (!token || token.type !== "code" || token.codeBlockStyle === "indented") return false;
+    const raw = typeof token.raw === "string" ? token.raw : "";
+    if (!raw) return false;
+    const openMatch = /^( {0,3})(`{3,}|~{3,})/.exec(raw);
+    if (!openMatch) return false;
+    const fenceChar = openMatch[2][0];
+    const fenceLen = openMatch[2].length;
+    const lines = raw.replace(/\r?\n$/, "").split(/\r?\n/);
+    if (lines.length < 2) return true;
+    const lastLine = lines[lines.length - 1];
+    const closeMatch = /^( {0,3})(`{3,}|~{3,})[ \t]*$/.exec(lastLine);
+    return !(closeMatch && closeMatch[2][0] === fenceChar && closeMatch[2].length >= fenceLen);
+  }
+
+  function findUnclosedStreamingCodeBlockIndex(tokens) {
+    let codeCount = 0;
+    let lastCodeToken = null;
+    const walk = (list) => {
+      if (!Array.isArray(list)) return;
+      for (let i = 0; i < list.length; i++) {
+        const tok = list[i];
+        if (!tok || typeof tok !== "object") continue;
+        if (tok.type === "code") {
+          codeCount += 1;
+          lastCodeToken = tok;
+        }
+        if (Array.isArray(tok.tokens)) walk(tok.tokens);
+        if (Array.isArray(tok.items)) walk(tok.items);
+      }
+    };
+    walk(tokens);
+    if (codeCount > 0 && isUnclosedFencedCodeToken(lastCodeToken)) {
+      return codeCount - 1;
+    }
+    return -1;
+  }
+
   const hljsCache = new Map();
+
+  function getHljsCacheSize() {
+    return hljsCache.size;
+  }
+
+  function clearHljsCache() {
+    hljsCache.clear();
+  }
+
+  function extractCodeTextFromCopyButton(copyCodeBtn) {
+    if (!copyCodeBtn) return "";
+    const codeNode = copyCodeBtn.closest?.(".code-block-wrap")?.querySelector?.("pre code");
+    if (codeNode) return String(codeNode.textContent ?? "");
+    return copyCodeBtn.dataset?.code ? decodeURIComponent(copyCodeBtn.dataset.code) : "";
+  }
 
   function setupMarkdown() {
     if (!window.marked) return;
@@ -1955,8 +2257,16 @@
         lang = String(infostring || "").trim().split(/\s+/)[0];
       }
 
+      let skipHljs = false;
+      if (activeMarkdownMediaTracker && activeMarkdownMediaTracker.skipCodeBlockIndex >= 0) {
+        const blockIndex = activeMarkdownMediaTracker.streamingCodeIndex++;
+        if (blockIndex === activeMarkdownMediaTracker.skipCodeBlockIndex) {
+          skipHljs = true;
+        }
+      }
+
       let highlighted = escapeHtml(rawCode);
-      if (window.hljs && lang && rawCode.length <= 40000) {
+      if (!skipHljs && window.hljs && lang && rawCode.length <= 40000) {
         const cacheKey = `${lang}\u0000${rawCode}`;
         const cachedHtml = hljsCache.get(cacheKey);
         if (cachedHtml !== undefined) {
@@ -1976,14 +2286,14 @@
         }
       }
       const label = escapeHtml(lang || "code");
-      const encoded = encodeURIComponent(rawCode);
+      const codeClassAttr = skipHljs ? "" : ' class="hljs"';
       return `
         <div class="code-block-wrap">
           <div class="code-block-header">
             <span>${label}</span>
-            <button type="button" class="copy-code-btn" data-code="${encoded}" title="Копировать код" aria-label="Копировать код">${SVG.copy}</button>
+            <button type="button" class="copy-code-btn" title="Копировать код" aria-label="Копировать код">${SVG.copy}</button>
           </div>
-          <pre><code class="hljs">${highlighted}</code></pre>
+          <pre><code${codeClassAttr}>${highlighted}</code></pre>
         </div>
       `;
     };
@@ -2003,24 +2313,26 @@
       }
 
       const localRef = normalizeLocalPathRef(rawHref);
-      const srcUrl = localRef ? buildHubMediaUrl(localRef.cleanPath) : withMediaToken(rawHref);
-      const dlUrl = localRef
-        ? buildHubMediaUrl(localRef.cleanPath, { download: true })
-        : withMediaToken(rawHref, { download: true });
-      const probePath = localRef
-        ? localRef.cleanPath
-        : rawHref.split("?")[0].split("#")[0];
+      const userUpload = isUserChatUploadMediaRef(localRef, rawHref);
+      const { srcUrl, dlUrl } = resolveMarkdownMediaUrls(localRef, rawHref, userUpload);
+      const probePath = localRef?.cleanPath || chatUploadRefPath(rawHref);
       const basename = localRef
         ? localRef.basename
         : (probePath.split("/").pop() || "image");
 
-      if (localRef && activeMarkdownMediaTracker) {
-        activeMarkdownMediaTracker.renderedKeys.add(localRef.canonicalKey);
-      }
-
       let kind = "image";
       if (VIDEO_EXT_RE.test(probePath)) kind = "video";
       else if (AUDIO_EXT_RE.test(probePath)) kind = "audio";
+      else if ((localRef || userUpload) && !IMAGE_EXT_RE.test(probePath)) kind = "file";
+
+      const renderedKeys = activeMarkdownMediaTracker?.renderedKeys;
+      const duplicateFile = kind === "file" && localRef && renderedKeys?.has(localRef.canonicalKey);
+      if (localRef) renderedKeys?.add(localRef.canonicalKey);
+
+      if (userUpload || duplicateFile) {
+        const caption = rawText || basename;
+        return renderHubMediaLink({ kind, srcUrl, dlUrl, basename, caption, title: rawTitle, labelHtml: escapeHtml(caption) });
+      }
 
       return renderGeneratedMediaCard({
         kind,
@@ -2058,45 +2370,33 @@
       }
 
       const localRef = normalizeLocalPathRef(rawHref);
+      const probePath = localRef?.cleanPath || chatUploadRefPath(rawHref);
+      const kind = IMAGE_EXT_RE.test(probePath) ? "image"
+        : VIDEO_EXT_RE.test(probePath) ? "video"
+        : AUDIO_EXT_RE.test(probePath) ? "audio"
+        : !localRef?.hasLineAnchor && DELIVERABLE_FILE_EXT_RE.test(probePath) ? "file" : "";
+      const userUpload = kind && isUserChatUploadMediaRef(localRef, rawHref);
+      if (kind && (localRef || userUpload)) {
+        const basename = localRef?.basename || probePath.split("/").pop();
+        const media = {
+          kind, ...resolveMarkdownMediaUrls(localRef, rawHref, userUpload),
+          basename, caption: plainLabel || basename, titleText: rawTitle,
+        };
+        if (kind !== "file" && !userUpload && activeMarkdownMediaTracker) {
+          activeMarkdownMediaTracker.linkedMediaFallback.push({ key: localRef.canonicalKey, ...media });
+        }
+        return renderHubMediaLink({ ...media, title: rawTitle, labelHtml: innerHtml });
+      }
+
       if (!localRef) {
+        if (!isSafeExternalHref(rawHref)) {
+          return `<span class="unsafe-link-text">${innerHtml}</span>`;
+        }
         const titleAttr = rawTitle ? ` title="${escapeHtml(rawTitle)}"` : "";
-        const safeHref = escapeHtml(rawHref);
-        return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer"${titleAttr}>${innerHtml}</a>`;
+        return `<a href="${escapeHtml(rawHref)}" target="_blank" rel="noopener noreferrer"${titleAttr}>${innerHtml}</a>`;
       }
-
       const srcUrl = buildHubMediaUrl(localRef.cleanPath);
-      const dlUrl = buildHubMediaUrl(localRef.cleanPath, { download: true });
       const titleAttr = ` title="${escapeHtml(rawTitle || localRef.basename)}"`;
-
-      if (IMAGE_EXT_RE.test(localRef.cleanPath)) {
-        if (activeMarkdownMediaTracker) {
-          activeMarkdownMediaTracker.linkedMediaFallback.push({
-            key: localRef.canonicalKey,
-            kind: "image",
-            srcUrl,
-            dlUrl,
-            caption: plainLabel || localRef.basename,
-            basename: localRef.basename,
-          });
-        }
-        return `<a href="${escapeHtml(srcUrl)}" target="_blank" rel="noopener" class="hub-media-link" data-lightbox-src="${escapeHtml(srcUrl)}" data-lightbox-dl="${escapeHtml(dlUrl)}" data-lightbox-caption="${escapeHtml(plainLabel || localRef.basename)}"${titleAttr}>${innerHtml}</a>`;
-      }
-
-      if (VIDEO_EXT_RE.test(localRef.cleanPath) || AUDIO_EXT_RE.test(localRef.cleanPath)) {
-        const kind = VIDEO_EXT_RE.test(localRef.cleanPath) ? "video" : "audio";
-        if (activeMarkdownMediaTracker) {
-          activeMarkdownMediaTracker.linkedMediaFallback.push({
-            key: localRef.canonicalKey,
-            kind,
-            srcUrl,
-            dlUrl,
-            caption: plainLabel || localRef.basename,
-            basename: localRef.basename,
-          });
-        }
-        return `<a href="${escapeHtml(dlUrl)}" download="${escapeHtml(localRef.basename)}" class="hub-media-link"${titleAttr}>${innerHtml}</a>`;
-      }
-
       const anchorSuffix = localRef.fragment ? escapeHtml(localRef.fragment) : "";
       return `<a href="${escapeHtml(srcUrl)}${anchorSuffix}" target="_blank" rel="noopener" class="hub-file-link"${titleAttr}>${innerHtml}</a>`;
     };
@@ -2113,14 +2413,31 @@
     });
   }
 
-  function renderMarkdownSafe(mdText) {
+  function renderMarkdownSafe(mdText, opts = {}) {
     if (!mdText) return "";
     if (window.marked) {
-      const tracker = { renderedKeys: new Set(), linkedMediaFallback: [] };
+      const isStreaming = Boolean(opts && opts.isStreaming);
+      const tracker = {
+        renderedKeys: new Set(),
+        linkedMediaFallback: [],
+        streamingCodeIndex: 0,
+        skipCodeBlockIndex: -1,
+      };
       activeMarkdownMediaTracker = tracker;
       try {
         const normalized = preNormalizeMarkdownLocalPaths(mdText);
-        let html = window.marked.parse(normalized);
+        let html;
+        if (
+          isStreaming &&
+          typeof window.marked.lexer === "function" &&
+          typeof window.marked.parser === "function"
+        ) {
+          const tokens = window.marked.lexer(normalized);
+          tracker.skipCodeBlockIndex = findUnclosedStreamingCodeBlockIndex(tokens);
+          html = window.marked.parser(tokens);
+        } else {
+          html = window.marked.parse(normalized);
+        }
         if (tracker.linkedMediaFallback.length > 0) {
           const extraCards = [];
           for (const item of tracker.linkedMediaFallback) {
@@ -2474,6 +2791,7 @@
   }
 
   async function askUserConfirm(opts = {}) {
+    hideMsgSelectionToolbar();
     const cfg = typeof opts === "string" ? { message: opts } : opts || {};
     const message = String(cfg.message || "");
     const useNative =
@@ -2727,6 +3045,8 @@
           }
           loadUserTreeAndRadarState();
         }
+        applyNotificationPrefs(sys.user?.notification_prefs);
+        if (!notificationPushHint()) void loadNotificationState().catch(() => {});
         state.dockerStatus = sys.docker_status || null;
         state.models = sys.models || [];
         state.accountProfile = sys.account_profile || null;
@@ -2773,6 +3093,12 @@
 
       await sysTask;
       await Promise.all([projectsTask, sidebarTask, quickDockTask, chatTask]);
+      await openNotificationQuery().catch(() => {});
+      if (pendingNotificationTarget) {
+        const target = pendingNotificationTarget;
+        pendingNotificationTarget = null;
+        await openNotificationTarget(target).catch(() => {});
+      }
       renderQuickRecentDock();
 
       reconcileOpenTabsWithChats();
@@ -11379,10 +11705,47 @@
     return true;
   }
 
+  function hasOpenModalBackdrop() {
+    return Boolean(
+      typeof document !== "undefined" &&
+      typeof document.querySelector === "function" &&
+      document.querySelector(".modal-backdrop:not(.hidden)")
+    );
+  }
+
   function hideMsgSelectionToolbar() {
     if (els.msgSelectionToolbar) {
       els.msgSelectionToolbar.classList.add("hidden");
     }
+  }
+
+  let modalBackdropSelectionObserver = null;
+  function bindModalBackdropSelectionGuard() {
+    if (
+      modalBackdropSelectionObserver ||
+      typeof MutationObserver !== "function" ||
+      typeof document === "undefined" ||
+      typeof document.querySelectorAll !== "function"
+    ) {
+      return;
+    }
+    const modals = document.querySelectorAll(".modal-backdrop");
+    if (!modals || modals.length === 0) return;
+    modalBackdropSelectionObserver = new MutationObserver((mutations) => {
+      for (let i = 0; i < mutations.length; i++) {
+        const target = mutations[i].target;
+        if (target && target.classList && !target.classList.contains("hidden")) {
+          hideMsgSelectionToolbar();
+          return;
+        }
+      }
+    });
+    modals.forEach((modal) => {
+      modalBackdropSelectionObserver.observe(modal, {
+        attributes: true,
+        attributeFilter: ["class"],
+      });
+    });
   }
 
   // ===================== CHAT DRAG & DROP FILE ATTACHMENT (v=109) =====================
@@ -15801,12 +16164,7 @@
     } catch {
       state.activitySectionCollapsed = false;
     }
-    try {
-      state.mobTelemetryExpanded =
-        localStorage.getItem(`agy_hub_mob_telem_exp_${userKey}`) === "1";
-    } catch {
-      state.mobTelemetryExpanded = false;
-    }
+    state.telemetryDockMode = loadTelemetryDockMode(userKey);
     syncActivitySectionCollapsedUI();
     syncMobileTelemetryExpandedUI();
 
@@ -15842,8 +16200,45 @@
     syncActivitySectionCollapsedUI();
   }
 
+  let _telemetryDockResizeRaf = 0;
+  let _telemetryDockEventsBound = false;
+
+  function normalizeTelemetryDockMode(mode) {
+    if (mode === "expanded" || mode === "collapsed" || mode === "auto") return mode;
+    return "auto";
+  }
+
+  function isAutoTelemetryExpandedViewport() {
+    const w = Number(typeof window !== "undefined" ? window.innerWidth : 1440) || 1440;
+    const h = Number(typeof window !== "undefined" ? window.innerHeight : 900) || 900;
+    return w > 860 && h >= 960;
+  }
+
+  function loadTelemetryDockMode(userKey = getRadarUserKey()) {
+    try {
+      const saved = localStorage.getItem(`agy_hub_telem_mode_${userKey}`);
+      if (saved === "auto" || saved === "collapsed" || saved === "expanded") {
+        return saved;
+      }
+      const legacyMobExp = localStorage.getItem(`agy_hub_mob_telem_exp_${userKey}`) === "1";
+      const isMobile = Number(typeof window !== "undefined" ? window.innerWidth : 1440) <= 860;
+      if (legacyMobExp && isMobile) {
+        return "expanded";
+      }
+    } catch {}
+    return "auto";
+  }
+
+  function resolveTelemetryDockExpanded(mode = state.telemetryDockMode) {
+    const norm = normalizeTelemetryDockMode(mode);
+    if (norm === "expanded") return true;
+    if (norm === "collapsed") return false;
+    return isAutoTelemetryExpandedViewport();
+  }
+
   function syncMobileTelemetryExpandedUI() {
-    const exp = Boolean(state.mobTelemetryExpanded);
+    const exp = resolveTelemetryDockExpanded(state.telemetryDockMode);
+    state.mobTelemetryExpanded = exp;
     if (els.sidebarFooter) {
       els.sidebarFooter.classList.toggle("is-mob-telemetry-expanded", exp);
     }
@@ -15852,20 +16247,53 @@
     }
     if (els.mobTelemetryExpandBtn) {
       els.mobTelemetryExpandBtn.setAttribute("aria-expanded", exp ? "true" : "false");
+      els.mobTelemetryExpandBtn.title = exp
+        ? "Свернуть подробные шкалы лимитов"
+        : "Показать подробные шкалы лимитов";
     }
   }
 
-  function setMobileTelemetryExpanded(expanded) {
-    state.mobTelemetryExpanded = Boolean(expanded);
+  function setTelemetryDockMode(mode) {
+    const nextMode = normalizeTelemetryDockMode(mode);
+    state.telemetryDockMode = nextMode;
     try {
-      const key = `agy_hub_mob_telem_exp_${getRadarUserKey()}`;
-      if (state.mobTelemetryExpanded) {
-        localStorage.setItem(key, "1");
-      } else {
-        localStorage.removeItem(key);
-      }
+      const key = `agy_hub_telem_mode_${getRadarUserKey()}`;
+      localStorage.setItem(key, nextMode);
     } catch {}
     syncMobileTelemetryExpandedUI();
+  }
+
+  function setMobileTelemetryExpanded(expanded) {
+    setTelemetryDockMode(expanded ? "expanded" : "collapsed");
+  }
+
+  function scheduleTelemetryDockAutoSync() {
+    if (normalizeTelemetryDockMode(state.telemetryDockMode) !== "auto") return;
+    if (_telemetryDockResizeRaf) return;
+    const schedule =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (fn) => setTimeout(fn, 16);
+    _telemetryDockResizeRaf = schedule(() => {
+      _telemetryDockResizeRaf = 0;
+      if (normalizeTelemetryDockMode(state.telemetryDockMode) === "auto") {
+        syncMobileTelemetryExpandedUI();
+      }
+    });
+  }
+
+  function bindTelemetryDockEvents() {
+    if (_telemetryDockEventsBound) return;
+    _telemetryDockEventsBound = true;
+    if (els.mobTelemetryExpandBtn) {
+      els.mobTelemetryExpandBtn.addEventListener("click", () => {
+        const currentlyExpanded = resolveTelemetryDockExpanded(state.telemetryDockMode);
+        setTelemetryDockMode(currentlyExpanded ? "collapsed" : "expanded");
+      });
+    }
+    if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+      window.addEventListener("resize", scheduleTelemetryDockAutoSync, { passive: true });
+    }
   }
 
   function normalizeProjectOrderNames(list, limit = 300) {
@@ -16309,6 +16737,10 @@
     const runningCount = telem.runningChatsCount;
     const totalQueuedCount = telem.totalQueuedCount;
     const unreadCount = telem.unreadDoneCount;
+    try {
+      const badge = unreadCount ? navigator.setAppBadge?.(unreadCount) : navigator.clearAppBadge?.();
+      badge?.catch(() => {});
+    } catch {}
     const unreadRunsTotal = telem.unreadCompletedRunsTotal;
     const hasAnyRadar = runningCount > 0 || totalQueuedCount > 0 || unreadCount > 0;
 
@@ -18741,28 +19173,15 @@
             ? " has-unread-activity"
             : " has-unread-activity has-unread-stopped";
 
-          const groupEl = document.createElement("div");
-          groupEl.className =
-            "proj-tree-group" +
-            (isExpanded ? " expanded" : "") +
-            (isSelectedProj ? " is-selected-proj" : "") +
-            (hasActiveChatInProj ? " has-active-chat" : "") +
-            collapsedUnreadKindCls;
-          groupEl.dataset.projGroup = pName;
-          groupEl.style.setProperty("--proj-accent", getProjectAccentColor(pName));
-
           const procSum = proj.processes_summary || proj.host_services_summary || null;
           const procRunningCount = procSum ? Number(procSum.running_count || 0) : 0;
           const procCrashedCount = procSum ? Number(procSum.crashed_count || 0) : 0;
 
           const selfHubBadgeHtml = proj.is_self_hub
-            ? `<span class="proj-self-hub-badge" title="Системный проект ядра Antigravity Hub">⚙️ Ядро</span>`
+            ? `<span class="proj-self-hub-badge" title="Системный проект ядра ZeroHub" aria-label="Системный проект ядра ZeroHub">⚙️</span>`
             : "";
 
-          const pillParts = [];
-          if (selfHubBadgeHtml) {
-            pillParts.push(selfHubBadgeHtml);
-          }
+          let procPillHtml = "";
           if (procRunningCount > 0 || procCrashedCount > 0) {
             const procPillCls = procCrashedCount > 0 ? "is-crashed" : "is-running";
             const procPillText =
@@ -18775,49 +19194,74 @@
               procCrashedCount > 0
                 ? `Процессы «${escapeHtml(pName)}»: активно ${procRunningCount}, сбоев ${procCrashedCount} (нажмите для открытия)`
                 : `Фоновых процессов в работе: ${procRunningCount} (нажмите для открытия)`;
-            pillParts.push(
-              `<button type="button" draggable="false" class="proj-proc-pill ${procPillCls}" data-open-proj-processes="${escapeHtml(
-                pName
-              )}" title="${procPillTitle}">${procPillText}</button>`
-            );
+            procPillHtml = `<button type="button" draggable="false" class="proj-proc-pill ${procPillCls}" data-open-proj-processes="${escapeHtml(
+              pName
+            )}" title="${procPillTitle}">${procPillText}</button>`;
+          }
+
+          const statusEntries = [];
+          if (errCount > 0) {
+            statusEntries.push({
+              label: `Ошибки: ${errCount}`,
+              html: `<span class="proj-count-err" title="Чатов с ошибкой: ${errCount}">! ${errCount}</span>`,
+            });
           }
           if (runningCount > 0) {
-            pillParts.push(
-              `<span class="proj-count-running" title="Чатов в работе: ${runningCount}"><span class="proj-count-running-dot"></span><span>${runningCount}</span></span>`
-            );
-          }
-          if (projQueuedCount > 0) {
-            pillParts.push(
-              `<span class="proj-count-queued" title="Задач в очереди проекта: ${projQueuedCount}">${SVG.clockXs}<span>+${projQueuedCount}</span></span>`
-            );
+            statusEntries.push({
+              label: `В работе: ${runningCount}`,
+              html: `<span class="proj-count-running" title="Чатов в работе: ${runningCount}"><span class="proj-count-running-dot"></span><span>${runningCount}</span></span>`,
+            });
           }
           if (doneCount > 0) {
-            pillParts.push(
-              `<span class="proj-count-done" title="Готовых непросмотренных чатов: ${doneCount}">✓ ${doneCount}</span>`
-            );
+            statusEntries.push({
+              label: `Готово: ${doneCount}`,
+              html: `<span class="proj-count-done" title="Готовых непросмотренных чатов: ${doneCount}">✓ ${doneCount}</span>`,
+            });
+          }
+          if (projQueuedCount > 0) {
+            statusEntries.push({
+              label: `В очереди: ${projQueuedCount}`,
+              html: `<span class="proj-count-queued" title="Задач в очереди проекта: ${projQueuedCount}">${SVG.clockXs}<span>+${projQueuedCount}</span></span>`,
+            });
           }
           if (stoppedCount > 0) {
-            pillParts.push(
-              `<span class="proj-count-stopped" title="Остановленных чатов: ${stoppedCount}">⏹ ${stoppedCount}</span>`
-            );
+            statusEntries.push({
+              label: `Остановлено: ${stoppedCount}`,
+              html: `<span class="proj-count-stopped" title="Остановленных чатов: ${stoppedCount}">⏹ ${stoppedCount}</span>`,
+            });
           }
-          if (errCount > 0) {
-            pillParts.push(
-              `<span class="proj-count-err" title="Чатов с ошибкой: ${errCount}">! ${errCount}</span>`
-            );
+
+          const hasStatusBadges = statusEntries.length > 0;
+          let countersHtml = "";
+          if (hasStatusBadges) {
+            const visibleStatusPills = statusEntries.slice(0, 2).map((item) => item.html);
+            if (statusEntries.length > 2) {
+              visibleStatusPills.push(`<span class="proj-count-more">+${statusEntries.length - 2}</span>`);
+            }
+            const countersTitle = statusEntries.map((item) => item.label).join(" · ");
+            countersHtml = `<div class="proj-tree-counters proj-tree-badges-row" title="${escapeHtml(
+              countersTitle
+            )}">${visibleStatusPills.join("")}</div>`;
           }
+
+          const groupEl = document.createElement("div");
+          groupEl.className =
+            "proj-tree-group" +
+            (isExpanded ? " expanded" : "") +
+            (isSelectedProj ? " is-selected-proj" : "") +
+            (hasActiveChatInProj ? " has-active-chat" : "") +
+            (hasStatusBadges ? " has-badges" : "") +
+            collapsedUnreadKindCls;
+          groupEl.dataset.projGroup = pName;
+          groupEl.style.setProperty("--proj-accent", getProjectAccentColor(pName));
+
           const hasLoadedChatsList =
             Array.isArray(state.chats) && (state.chats.length > 0 || rawProjChats.length > 0);
           const idleTotal = hasLoadedChatsList
             ? projOrdered.length
             : Number(proj.hub_chat_count || 0);
           const idleCountHtml =
-            runningCount === 0 &&
-            projQueuedCount === 0 &&
-            doneCount === 0 &&
-            stoppedCount === 0 &&
-            errCount === 0 &&
-            idleTotal > 0
+            !hasStatusBadges && idleTotal > 0
               ? `<span class="proj-count-idle">${idleTotal}</span>`
               : "";
 
@@ -18837,7 +19281,7 @@
             : "";
 
           const headerEl = document.createElement("div");
-          headerEl.className = "proj-tree-header" + (pillParts.length > 0 ? " has-badges" : "");
+          headerEl.className = "proj-tree-header" + (hasStatusBadges ? " has-badges" : "");
           headerEl.draggable = true;
           headerEl.innerHTML = `
             <div class="proj-tree-head-top">
@@ -18847,8 +19291,11 @@
                 <span class="proj-tree-folder-ico" aria-hidden="true">${SVG.folder}</span>
                 <span class="proj-tree-name" title="${escapeHtml(pName)}">${escapeHtml(pName)}</span>
                 ${sharedBadgeHtml}
+                ${selfHubBadgeHtml}
               </div>
+              ${procPillHtml}
               <div class="proj-tree-head-right">
+                ${countersHtml}
                 ${idleCountHtml}
                 <div class="proj-tree-quick-btns">
                   <button type="button" draggable="false" class="proj-inline-more-btn" title="Действия с проектом">${SVG.dots || "⋯"}</button>
@@ -18861,11 +19308,6 @@
                 </div>
               </div>
             </div>
-            ${
-              pillParts.length > 0
-                ? `<div class="proj-tree-counters proj-tree-badges-row">${pillParts.join("")}</div>`
-                : ""
-            }
           `;
 
           const gripEl = headerEl.querySelector(".proj-drag-grip");
@@ -20231,6 +20673,8 @@
     const streamThLen = m.status === "streaming" ? (m.thinking || "").length : 0;
     const thAct = m._thinkingActive ? 1 : 0;
     const uTok = (m.usage && m.usage.total_tokens) || 0;
+    const uDur = (m.usage && m.usage.duration_ms) || 0;
+    const genStart = m.status === "streaming" ? Number(m.gen_started_at_ms) || 0 : 0;
     const refSig =
       m.usage && Array.isArray(m.usage.referenced_chats)
         ? m.usage.referenced_chats
@@ -20263,7 +20707,7 @@
     )
       ? 1
       : 0;
-    return `${m.id}|${m.role}|${m.status || "done"}|${(m.content || "").length}|${tcArr.length}:${tcSig}|${attLen}|${hasTh}|${streamThLen}|${thAct}|${uTok}|${refSig}|${hoSig}|${hqrSig}|${envMetaKind}|${bm}|${pm}`;
+    return `${m.id}|${m.role}|${m.status || "done"}|${(m.content || "").length}|${tcArr.length}:${tcSig}|${attLen}|${hasTh}|${streamThLen}|${thAct}|${uTok}:${uDur}:${genStart}|${refSig}|${hoSig}|${hqrSig}|${envMetaKind}|${bm}|${pm}`;
   }
 
   function computeMessagesSignature(messages, chat) {
@@ -20308,6 +20752,7 @@
     while (els.messagesList && els.messagesList.firstChild) {
       frag.appendChild(els.messagesList.firstChild);
     }
+    stopLiveAssistantElapsedTimer();
 
     const clonedMsgs = Array.isArray(state.messages) ? state.messages.slice() : [];
     const sig = computeMessagesSignature(clonedMsgs, state.activeChat);
@@ -20382,6 +20827,7 @@
         updateOlderHistoryFoldBar();
         syncMessageDateDividers(els.messagesList);
         syncMessageSelectDomRows();
+        syncLiveAssistantElapsedDom();
         refreshChatOutline();
         return;
       }
@@ -20403,6 +20849,7 @@
       els.welcomeState.classList.add("hidden");
       syncMessageDateDividers(els.messagesList);
       syncMessageSelectDomRows();
+      syncLiveAssistantElapsedDom();
       refreshChatOutline();
       return;
     }
@@ -20479,6 +20926,7 @@
 
             syncMessageDateDividers(els.messagesList);
             syncMessageSelectDomRows();
+            syncLiveAssistantElapsedDom();
 
             if (
               state.autoScroll &&
@@ -20521,6 +20969,7 @@
     state.openingChatBuffer = null;
 
     state.activeChatId = null;
+    queueClientFocus();
     state.activeChat = null;
     state.viewingDesktopConv = null;
     state.messages = [];
@@ -20762,6 +21211,7 @@
     state.activeDraftSendId = 0;
     state.viewingDesktopConv = null;
     state.activeChatId = chatId;
+    queueClientFocus();
 
     const clearedUnreadOnOpen =
       !effectiveSilentSync && !document.hidden
@@ -20842,6 +21292,7 @@
           } else {
             syncMessageDateDividers(els.messagesList);
             syncMessageSelectDomRows();
+            syncLiveAssistantElapsedDom();
           }
         } else {
           cachedView.domDirty = false;
@@ -21677,20 +22128,6 @@
   }
 
   // ===================== CONTEXT METER & LOSSLESS COMPACTION =====================
-  function formatCompactTokens(n) {
-    const num = Math.max(0, Number(n) || 0);
-    if (num >= 1000000) {
-      return `${(num / 1000000).toFixed(num % 1000000 === 0 ? 0 : 1)}M`;
-    }
-    if (num >= 10000) {
-      return `${(num / 1000).toFixed(num >= 100000 ? 0 : 1).replace(/\.0$/, "")}k`;
-    }
-    if (num >= 1000) {
-      return `${(num / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-    }
-    return String(Math.round(num));
-  }
-
   function estimateDraftTokens(txt) {
     if (!txt) return 0;
     let cyr = 0;
@@ -22246,6 +22683,7 @@
       scrollGuard.lockedAtAnswerStart = false;
       scrollGuard.maxAutoScrollTopInTurn = 0;
       if (els.scrollBottomBtn) els.scrollBottomBtn.classList.add("hidden");
+      stopLiveAssistantElapsedTimer();
       refreshChatOutline();
       return;
     }
@@ -22257,6 +22695,7 @@
     updateOlderHistoryFoldBar();
     syncMessageDateDividers(els.messagesList);
     syncMessageSelectDomRows();
+    syncLiveAssistantElapsedDom();
     // The outline rail can narrow the message stream and reflow its contents.
     refreshChatOutline();
     if (forceScrollBottom) applyForcedBottomScroll(allMsgs);
@@ -22650,8 +23089,10 @@
     ".tools-list",
     ".tool-pill",
     ".assistant-header",
+    ".msg-live-elapsed",
     ".msg-continue-bar",
     ".msg-actions",
+    ".usage-hint",
     ".msg-hq-return-group",
     ".msg-hq-return-btn",
     ".msg-pin-memory-btn",
@@ -23667,20 +24108,23 @@
           "read_only"
         : "read_only";
 
+    const resumeStartMs = Date.now();
     m._preResumeBackup = {
       content: m.content || "",
       status: m.status,
+      gen_started_at_ms: m.gen_started_at_ms,
       tool_calls: Array.isArray(m.tool_calls)
         ? m.tool_calls.map((tc) => Object.assign({}, tc))
         : [],
     };
     m.content = stripInterruptBannerFromContent(m.content || "");
     m.status = "streaming";
+    m.gen_started_at_ms = resumeStartMs;
     m._thinkingActive = !Boolean((m.content || "").trim());
     m._streamSeq = 0;
 
     state.recentlyFinishedAt.delete(String(chatId));
-    state.localGenStartedAt.set(String(chatId), Date.now());
+    state.localGenStartedAt.set(String(chatId), resumeStartMs);
     markChatGenerating(chatId, true);
     if (activeChat) activeChat.is_generating = true;
 
@@ -23706,13 +24150,19 @@
   // during `text_delta`, the Markdown is never re-parsed on `thinking_update` / `tool_step`).
   const ASSISTANT_SLOT_ORDER = ["header", "thinking", "tools", "body", "footer"];
 
+  function fastTextHash32(str) {
+    const s = String(str || "");
+    let h = 0x811c9dc5;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+    return (h >>> 0).toString(36);
+  }
+
   function hashAssistantSlotString(str) {
     const s = String(str || "");
-    let h = 5381;
-    for (let i = 0; i < s.length; i++) {
-      h = ((h << 5) + h + s.charCodeAt(i)) | 0;
-    }
-    return `${s.length}:${(h >>> 0).toString(36)}`;
+    return `${s.length}:${fastTextHash32(s)}`;
   }
 
   function normalizeAssistantOpenState(openState) {
@@ -23731,9 +24181,17 @@
         raw += ";-";
         continue;
       }
-      const outLen =
-        Number(tc.output_len ?? (tc.output ? String(tc.output).length : 0)) || 0;
-      raw += `;${tc.step_index !== undefined ? tc.step_index : ""}:${tc.state || ""}:${outLen}:${tc.name || ""}`;
+      const outStr = tc.output !== undefined && tc.output !== null ? String(tc.output) : "";
+      const outLen = Number(tc.output_len ?? outStr.length) || 0;
+      const outHash = outStr ? fastTextHash32(outStr) : "";
+      const errHash = tc.error ? fastTextHash32(String(tc.error)) : "";
+      let paramsHash = "";
+      if (tc.parameters && typeof tc.parameters === "object") {
+        try {
+          paramsHash = fastTextHash32(JSON.stringify(tc.parameters));
+        } catch {}
+      }
+      raw += `;${tc.step_index !== undefined ? tc.step_index : ""}:${tc.state || ""}:${outLen}:${outHash}:${errHash}:${paramsHash}:${tc.name || ""}`;
     }
     return `t${hashAssistantSlotString(raw)}`;
   }
@@ -23743,6 +24201,20 @@
       ? `<span class="model-tag">${escapeHtml(msg.model)}</span>`
       : "";
     const timeTagHtml = buildMessageTimeTagHtml(msg);
+    let liveElapsedHtml = "";
+    if (msg.status === "streaming") {
+      const hasPrevDur = Boolean(msg.usage && Number(msg.usage.duration_ms) > 0);
+      const parsedCreated = !hasPrevDur ? parseHubMessageTimestamp(msg.created_at) : null;
+      const startMs =
+        Number(msg.gen_started_at_ms) ||
+        (parsedCreated ? parsedCreated.getTime() : 0) ||
+        Number(state.localGenStartedAt.get(String(msg.chat_id || state.activeChatId || ""))) ||
+        0;
+      const baseMs = Math.max(0, Number(msg.usage && msg.usage.duration_ms) || 0);
+      if (startMs > 0 || baseMs > 0) {
+        liveElapsedHtml = `<span class="msg-live-elapsed" data-gen-start-ms="${escapeHtml(String(startMs))}" data-gen-base-ms="${escapeHtml(String(baseMs))}" aria-label="Время генерации"></span>`;
+      }
+    }
     const hasBody = Boolean(rawContentStr.trim());
     const headerBookmarkBtn = buildMsgBookmarkBtnHtml(msg);
     const headerReplyBtn =
@@ -23763,6 +24235,7 @@
         <span class="assistant-author">Antigravity</span>
         ${modelBadge}
         ${timeTagHtml}
+        ${liveElapsedHtml}
         ${headerBookmarkBtn}
         ${headerReplyBtn}
         ${headerCopyBtn}
@@ -23779,26 +24252,151 @@
     return `${(n / 1000000).toFixed(1)}M`;
   }
 
+  function formatTurnDuration(durationMs, { compact = false } = {}) {
+    const ms = Number(durationMs);
+    if (!Number.isFinite(ms) || ms <= 0) return "";
+    if (ms < 10000) {
+      const tenths = Math.max(1, Math.round(ms / 100));
+      if (tenths < 100) {
+        const val = tenths % 10 === 0 ? String(tenths / 10) : (tenths / 10).toFixed(1);
+        return compact ? `${val}с` : `${val} с`;
+      }
+    }
+    const totalSec = Math.round(ms / 1000);
+    if (totalSec < 60) {
+      return compact ? `${totalSec}с` : `${totalSec} с`;
+    }
+    if (totalSec < 3600) {
+      const mins = Math.floor(totalSec / 60);
+      const secs = totalSec % 60;
+      if (secs === 0) {
+        return compact ? `${mins}м` : `${mins} мин`;
+      }
+      return compact ? `${mins}м ${secs}с` : `${mins} мин ${secs} с`;
+    }
+    const totalMins = Math.floor(totalSec / 60);
+    const hours = Math.floor(totalMins / 60);
+    const mins = totalMins % 60;
+    if (mins === 0) {
+      return compact ? `${hours}ч` : `${hours} ч`;
+    }
+    const minStr = String(mins).padStart(2, "0");
+    return compact ? `${hours}ч ${minStr}м` : `${hours} ч ${minStr} мин`;
+  }
+
+  function formatLiveStreamElapsed(elapsedMs) {
+    const ms = Number(elapsedMs);
+    const totalSec = Number.isFinite(ms) && ms > 0 ? Math.floor(ms / 1000) : 0;
+    const hours = Math.floor(totalSec / 3600);
+    const mins = Math.floor((totalSec % 3600) / 60);
+    const secs = totalSec % 60;
+    const secStr = String(secs).padStart(2, "0");
+    if (hours > 0) {
+      return `${hours}:${String(mins).padStart(2, "0")}:${secStr}`;
+    }
+    return `${mins}:${secStr}`;
+  }
+
+  let liveAssistantElapsedTimer = null;
+
+  function stopLiveAssistantElapsedTimer() {
+    if (liveAssistantElapsedTimer) {
+      clearInterval(liveAssistantElapsedTimer);
+      liveAssistantElapsedTimer = null;
+    }
+  }
+
+  function updateLiveAssistantElapsedNode(el, nowMsVal = Date.now()) {
+    if (!el) return;
+    const startMs = Number(el.dataset && el.dataset.genStartMs) || 0;
+    const baseMs = Math.max(0, Number(el.dataset && el.dataset.genBaseMs) || 0);
+    const elapsedMs = startMs > 0 ? baseMs + Math.max(0, nowMsVal - startMs) : baseMs;
+    const nextText = formatLiveStreamElapsed(elapsedMs);
+    if (el.textContent !== nextText) {
+      el.textContent = nextText;
+    }
+  }
+
+  function syncLiveAssistantElapsedDom(nowMsVal = Date.now()) {
+    const list = els.messagesList;
+    const nodes =
+      list && typeof list.querySelectorAll === "function"
+        ? list.querySelectorAll(".msg-live-elapsed")
+        : [];
+    for (let i = 0; i < nodes.length; i++) {
+      updateLiveAssistantElapsedNode(nodes[i], nowMsVal);
+    }
+    const isHidden = typeof document !== "undefined" && Boolean(document.hidden);
+    if (nodes.length > 0 && !isHidden) {
+      if (!liveAssistantElapsedTimer) {
+        liveAssistantElapsedTimer = setInterval(() => {
+          if (typeof document !== "undefined" && document.hidden) {
+            stopLiveAssistantElapsedTimer();
+            return;
+          }
+          syncLiveAssistantElapsedDom(Date.now());
+        }, 1000);
+      }
+    } else {
+      stopLiveAssistantElapsedTimer();
+    }
+    return nodes.length;
+  }
+
   function buildAssistantFooterInnerHtml(msg, rawContentStr) {
     const hasBody = Boolean(rawContentStr.trim());
+    const u = msg && msg.usage && typeof msg.usage === "object" ? msg.usage : null;
+    const totalNum = u && Number(u.total_tokens) > 0 ? Number(u.total_tokens) : 0;
+    const durMs = u && Number(u.duration_ms) > 0 ? Number(u.duration_ms) : 0;
+    const durFull = durMs > 0 ? formatTurnDuration(durMs, { compact: false }) : "";
+    const durShort = durMs > 0 ? formatTurnDuration(durMs, { compact: true }) : "";
     let usageTokens = "";
-    if (msg.usage && msg.usage.total_tokens) {
-      const u = msg.usage;
-      const totalNum = Number(u.total_tokens) || 0;
-      const fullTokText = `${totalNum.toLocaleString("ru-RU")} tok`;
-      const shortTokText = formatUsageTokensShort(totalNum);
-      const tipParts = [];
-      if (u.input_tokens) tipParts.push(`Вход: ${Number(u.input_tokens).toLocaleString("ru-RU")}`);
-      if (u.thinking_tokens) tipParts.push(`Мысли: ${Number(u.thinking_tokens).toLocaleString("ru-RU")}`);
-      if (u.output_tokens) tipParts.push(`Выход: ${Number(u.output_tokens).toLocaleString("ru-RU")}`);
-      if (u.cache_read_tokens) tipParts.push(`Кэш: ${Number(u.cache_read_tokens).toLocaleString("ru-RU")}`);
-      const tipAttr = tipParts.length
-        ? `${fullTokText} · ${tipParts.join(" · ")} (нажмите для сводки квот)`
-        : fullTokText;
+    if (totalNum > 0 || durFull) {
+      const partsHtml = [];
+      const tipHeadParts = [];
+      if (durFull) {
+        partsHtml.push(
+          `<span class="usage-dur">` +
+            `<span class="usage-dur-full">${escapeHtml(durFull)}</span>` +
+            `<span class="usage-dur-short">${escapeHtml(durShort)}</span>` +
+          `</span>`
+        );
+        let durTip = `Время генерации: ${durFull}`;
+        const lastRunDurMs = Number(u && u.last_run_duration_ms) || 0;
+        if (Number(u && u.proc_runs) > 1 && lastRunDurMs > 0 && lastRunDurMs < durMs) {
+          const lastRunDurStr = formatTurnDuration(lastRunDurMs, { compact: false });
+          if (lastRunDurStr) {
+            durTip += ` (посл. прогон: ${lastRunDurStr})`;
+          }
+        }
+        tipHeadParts.push(durTip);
+      }
+      if (totalNum > 0) {
+        if (durFull) {
+          partsHtml.push(`<span class="usage-sep" aria-hidden="true"> · </span>`);
+        }
+        const fullTokText = `${totalNum.toLocaleString("ru-RU")} tok`;
+        const shortTokText = formatUsageTokensShort(totalNum);
+        partsHtml.push(
+          `<span class="usage-tok-full">${escapeHtml(fullTokText)}</span>` +
+          `<span class="usage-tok-short">${escapeHtml(shortTokText)}</span>`
+        );
+        const tipParts = [];
+        if (u.input_tokens) tipParts.push(`Вход: ${Number(u.input_tokens).toLocaleString("ru-RU")}`);
+        if (u.thinking_tokens) tipParts.push(`Мысли: ${Number(u.thinking_tokens).toLocaleString("ru-RU")}`);
+        if (u.output_tokens) tipParts.push(`Выход: ${Number(u.output_tokens).toLocaleString("ru-RU")}`);
+        if (u.cache_read_tokens) tipParts.push(`Кэш: ${Number(u.cache_read_tokens).toLocaleString("ru-RU")}`);
+        tipHeadParts.push(
+          tipParts.length
+            ? `${fullTokText} · ${tipParts.join(" · ")} (нажмите для сводки квот)`
+            : fullTokText
+        );
+      }
+      const tipAttr = tipHeadParts.join(" · ");
+      const quotaAttrs = totalNum > 0 ? ` data-open-quotas="1" style="cursor:pointer"` : "";
       usageTokens =
-        `<span class="usage-hint" data-open-quotas="1" style="cursor:pointer" title="${escapeHtml(tipAttr)}">` +
-        `<span class="usage-tok-full">${escapeHtml(fullTokText)}</span>` +
-        `<span class="usage-tok-short">${escapeHtml(shortTokText)}</span>` +
+        `<span class="usage-hint"${quotaAttrs} title="${escapeHtml(tipAttr)}">` +
+        partsHtml.join("") +
         `</span>`;
     }
 
@@ -23891,10 +24489,13 @@
     let continueBarHtml = "";
     if (isResumableAssistantMessage(msg)) {
       const toolCount = Array.isArray(msg.tool_calls) ? msg.tool_calls.length : 0;
+      const durSuffix = !hasBody && durFull ? ` · ${durFull}` : "";
       const hintText =
         toolCount > 0
-          ? `Прогресс сохранён (${toolCount} шаг.) · допишет это же сообщение`
-          : "Продолжит ответ в этой же карточке";
+          ? `Прогресс сохранён (${toolCount} шаг.${durSuffix}) · допишет это же сообщение`
+          : !hasBody && durFull
+            ? `Время: ${durFull} · продолжит ответ в этой же карточке`
+            : "Продолжит ответ в этой же карточке";
       continueBarHtml = `
         <div class="msg-continue-bar">
           <button type="button" class="msg-continue-btn" data-continue-msg="${msg.id}" title="Убрать ошибку и продолжить выполнение задачи в этом же сообщении">
@@ -23937,24 +24538,34 @@
         ? `<p><em>Генерация остановлена пользователем.</em></p>`
         : "";
     const procCardsHtml = buildMessageProcessCardsHtml(msg);
-    return `<div class="markdown-body">${renderMarkdownSafe(rawContentStr) + cancelledNote}</div>${procCardsHtml}`;
+    const renderedMd = renderMarkdownSafe(rawContentStr, {
+      isStreaming: msg.status === "streaming",
+    });
+    return `<div class="markdown-body">${renderedMd + cancelledNote}</div>${procCardsHtml}`;
+  }
+
+  function normalizeAssistantMessageContent(msg) {
+    return stripFalseTrailingLocationBanner(
+      stripTaskProfileFromText(String((msg && msg.content) || "")),
+      msg
+    );
   }
 
   // Returns `{ sig, html() }` for one slot; `html()` is lazy so that unchanged slots
   // (notably the Markdown body) are never rendered.
-  function describeAssistantSlot(msg, slot, openState) {
+  function describeAssistantSlot(msg, slot, openState, precomputedRawContent) {
     const o = normalizeAssistantOpenState(openState);
-    const raw = stripFalseTrailingLocationBanner(
-      stripTaskProfileFromText(String(msg.content || "")),
-      msg
-    );
+    const raw =
+      typeof precomputedRawContent === "string"
+        ? precomputedRawContent
+        : normalizeAssistantMessageContent(msg);
     if (slot === "header") {
       const html = buildAssistantHeaderInnerHtml(msg, raw);
       return { sig: `h${hashAssistantSlotString(html)}`, html: () => html };
     }
     if (slot === "thinking") {
-      const thinkingLen = msg.thinking ? String(msg.thinking).length : 0;
-      const sig = `k${msg.has_thinking ? 1 : 0}|${msg._thinkingActive ? 1 : 0}|${thinkingLen}|${o.thinkingOpen ? 1 : 0}`;
+      const thinkingText = msg.thinking ? String(msg.thinking) : "";
+      const sig = `k${msg.has_thinking ? 1 : 0}|${msg._thinkingActive ? 1 : 0}|${thinkingText.length}:${fastTextHash32(thinkingText)}|${o.thinkingOpen ? 1 : 0}`;
       return { sig, html: () => buildThinkingHtml(msg, o.thinkingOpen) };
     }
     if (slot === "tools") {
@@ -23964,13 +24575,12 @@
       };
     }
     if (slot === "body") {
-      const tail = raw.length > 64 ? raw.slice(-64) : raw;
       const procCtrls = extractProcessControlsFromToolCalls(msg && msg.tool_calls);
       const procSig = procCtrls.length
         ? procCtrls.map((c) => `${c.name}:${c.runtime}:${c.port || 0}`).join(",")
         : "";
       return {
-        sig: `b${raw.length}|${msg.status || ""}|${hashAssistantSlotString(tail)}|${procSig}`,
+        sig: `b${raw.length}|${msg.status || ""}|${fastTextHash32(raw)}|${procSig}`,
         html: () => buildAssistantBodyInnerHtml(msg, raw),
       };
     }
@@ -23983,9 +24593,10 @@
   }
 
   function buildAssistantInnerHtml(msg, openState = false) {
+    const normalizedContent = normalizeAssistantMessageContent(msg);
     let out = "";
     for (const slot of ASSISTANT_SLOT_ORDER) {
-      const d = describeAssistantSlot(msg, slot, openState);
+      const d = describeAssistantSlot(msg, slot, openState, normalizedContent);
       out += wrapAssistantSlotHtml(slot, d.sig, d.html());
     }
     return out;
@@ -24271,6 +24882,8 @@
       const card = document.createElement("div");
       card.className = "assistant-card";
       card.innerHTML = buildAssistantInnerHtml(msg);
+      const liveEl = card.querySelector(".msg-live-elapsed");
+      if (liveEl) updateLiveAssistantElapsedNode(liveEl);
       row.appendChild(card);
     }
 
@@ -24289,6 +24902,7 @@
       els.messagesList.appendChild(newRow);
       syncMessageDateDividers(els.messagesList);
       syncMessageSelectDomRows();
+      syncLiveAssistantElapsedDom();
       if (msg._thinkingActive) {
         const nextThinkingEl = newRow.querySelector("details.thinking-box[open] .thinking-content");
         if (nextThinkingEl) {
@@ -24348,9 +24962,10 @@
 
     const slots = getAssistantSlotEls(card);
     if (slots) {
+      const normalizedContent = normalizeAssistantMessageContent(msg);
       for (const slot of ASSISTANT_SLOT_ORDER) {
         const slotEl = slots[slot];
-        const d = describeAssistantSlot(msg, slot, openState);
+        const d = describeAssistantSlot(msg, slot, openState, normalizedContent);
         if (slotEl.dataset.sig === d.sig) continue;
         slotEl.innerHTML = d.html();
         slotEl.dataset.sig = d.sig;
@@ -24392,6 +25007,7 @@
     }
 
     syncRowSelectableCheckDom(row, msg);
+    syncLiveAssistantElapsedDom();
     if (cardTopBeforeCollapse !== null) {
       compensateThinkingCollapse(card, cardTopBeforeCollapse);
     }
@@ -29111,11 +29727,13 @@
       lastWsActivityAt = Date.now();
       clearWsPongWatchdog();
       setWsOnline(true);
+      sendClientFocus();
       clearInterval(state.wsPingTimer);
       state.wsPingTimer = setInterval(() => {
         if (state.ws && state.ws.readyState === WebSocket.OPEN) {
           try {
             state.ws.send(JSON.stringify({ action: "ping" }));
+            sendClientFocus();
           } catch {}
         }
       }, 25000);
@@ -29158,8 +29776,16 @@
       setWsOnline(false);
       clearInterval(state.wsPingTimer);
       state.wsPingTimer = null;
+      if (state.ws === ws) {
+        state.ws = null;
+      }
       if (ev.code === 4401) {
         showLoginScreen();
+        return;
+      }
+      if (!state.token) {
+        clearTimeout(state.wsReconnectTimer);
+        state.wsReconnectTimer = null;
         return;
       }
       state.wsReconnectTimer = setTimeout(connectWebSocket, 1800);
@@ -29275,10 +29901,14 @@
       }
     } else if (t === "assistant_start" && evt.message) {
       const existing = findCachedMsg(evt.message.id);
+      const genStartedAtMs =
+        Number(evt.gen_started_at_ms || evt.message.gen_started_at_ms) ||
+        (evt.resumed ? Date.now() : Number(existing && existing.gen_started_at_ms) || Date.now());
       if (existing) {
         const prevBm = Boolean(existing.bookmarked);
         delete existing._preResumeBackup;
         Object.assign(existing, evt.message, {
+          gen_started_at_ms: genStartedAtMs,
           _thinkingActive: !Boolean((evt.message.content || "").trim()),
           _streamSeq: 0,
           bookmarked:
@@ -29291,7 +29921,13 @@
           ),
         });
       } else {
-        msgs.push(Object.assign({ _thinkingActive: true, _streamSeq: 0 }, evt.message));
+        msgs.push(
+          Object.assign(
+            { _thinkingActive: true, _streamSeq: 0, gen_started_at_ms: genStartedAtMs },
+            evt.message,
+            { gen_started_at_ms: genStartedAtMs }
+          )
+        );
       }
       if (entry.chat) entry.chat.is_generating = true;
       entry.domNeedsReconcile = true;
@@ -29599,10 +30235,14 @@
       }
     } else if (t === "assistant_start" && evt.message) {
       const existing = findMsg(evt.message.id);
+      const genStartedAtMs =
+        Number(evt.gen_started_at_ms || evt.message.gen_started_at_ms) ||
+        (evt.resumed ? Date.now() : Number(existing && existing.gen_started_at_ms) || Date.now());
       if (existing) {
         const prevBm = Boolean(existing.bookmarked);
         delete existing._preResumeBackup;
         Object.assign(existing, evt.message, {
+          gen_started_at_ms: genStartedAtMs,
           _thinkingActive: !Boolean((evt.message.content || "").trim()),
           _streamSeq: 0,
           bookmarked:
@@ -29624,7 +30264,11 @@
         }
         return;
       }
-      const m = Object.assign({ _thinkingActive: true, _streamSeq: 0 }, evt.message);
+      const m = Object.assign(
+        { _thinkingActive: true, _streamSeq: 0, gen_started_at_ms: genStartedAtMs },
+        evt.message,
+        { gen_started_at_ms: genStartedAtMs }
+      );
       state.messages.push(m);
       if (!skipDom) {
         syncComposerState();
@@ -29635,6 +30279,7 @@
         els.messagesList.appendChild(newRow);
         syncMessageDateDividers(els.messagesList);
         syncMessageSelectDomRows();
+        syncLiveAssistantElapsedDom();
         if (m._thinkingActive) {
           const nextThinkingEl = newRow.querySelector("details.thinking-box[open] .thinking-content");
           if (nextThinkingEl) nextThinkingEl.scrollTop = nextThinkingEl.scrollHeight;
@@ -29779,6 +30424,15 @@
   function handleWsEvent(evt) {
     const t = evt.type;
     if (t === "pong") return;
+    if (t === "notification_prefs_updated") {
+      applyNotificationPrefs(evt.notification_prefs);
+      return;
+    }
+    if (t === "notification_devices_updated") {
+      state.notifications.subscriptions = evt.subscriptions || [];
+      void syncNotificationDevice().catch(() => {});
+      return;
+    }
 
     if (t === "chat_read_synced") {
       const syncTs = Number(evt.read_ts_ms) || Date.now();
@@ -30005,11 +30659,7 @@
       if (sName) {
         if (transition === "crashed") {
           state.hostServices.dismissedCrashKeys.delete(`${pName.toLowerCase()}::${sName.toLowerCase()}`);
-          const codeTxt =
-            svc.exit_code !== null && svc.exit_code !== undefined ? svc.exit_code : "?";
-          showToast(
-            `🔴 Сбой процесса «${sName}» (${pName || "проект"}, код ${codeTxt})`
-          );
+          notifyProcessCrash(pName, svc);
         } else if (transition === "completed") {
           const durTxt = formatProcessDurationShort(svc.duration_sec ?? 0);
           showToast(
@@ -30426,6 +31076,11 @@
             if (cand && cand._preResumeBackup) {
               cand.content = cand._preResumeBackup.content;
               cand.status = cand._preResumeBackup.status;
+              if (cand._preResumeBackup.gen_started_at_ms !== undefined) {
+                cand.gen_started_at_ms = cand._preResumeBackup.gen_started_at_ms;
+              } else {
+                delete cand.gen_started_at_ms;
+              }
               cand.tool_calls = cand._preResumeBackup.tool_calls;
               cand._thinkingActive = false;
               delete cand._preResumeBackup;
@@ -30565,6 +31220,7 @@
         touchChatActivity(turnCid, normTurnEvent);
         if (normTurnEvent === "turn_done") {
           recordHandoffTargetOutcome(turnCid, "done");
+          notifyTurnEvent("turn_done", evt, turnCid);
           if (isChatInBackgroundForRadar(turnCid)) {
             const nextBatchRuns = (Number(state.batchCompletedRuns.get(turnCid)) || 0) + 1;
             state.batchCompletedRuns.set(turnCid, nextBatchRuns);
@@ -30584,6 +31240,7 @@
           }
         } else if (normTurnEvent === "turn_error") {
           recordHandoffTargetOutcome(turnCid, "error");
+          notifyTurnEvent("turn_error", evt, turnCid);
           if (isChatInBackgroundForRadar(turnCid)) {
             markChatUnreadCompleted(turnCid, "error", evt.chat || null);
           } else {
@@ -31150,6 +31807,403 @@
     });
   }
 
+  let notificationPrefsQueue = Promise.resolve();
+  let notificationRefresh = null;
+  let notificationAudio = null;
+  let notificationFocusTimer = null;
+  let recentNotificationEvents = [];
+  let pendingNotificationTarget = null;
+
+  function applyNotificationPrefs(raw) {
+    const notif = state.notifications;
+    const userKey = resolveActiveUsername();
+    if (notif.userKey !== userKey) {
+      Object.assign(notif, {
+        userKey, subscriptions: [], vapidPublicKey: "", currentSubId: "",
+        currentDevicePushActive: false, loaded: false,
+      });
+    }
+    const storageKey = "agy_hub_notif_prefs_" + userKey;
+    if (!raw) {
+      try { raw = JSON.parse(localStorage.getItem(storageKey) || "{}"); } catch {}
+    }
+    notif.prefs = { ...NOTIFICATION_DEFAULTS };
+    for (const key of Object.keys(NOTIFICATION_CHECKBOXES)) {
+      if (typeof raw?.[key] === "boolean") notif.prefs[key] = raw[key];
+    }
+    notif.prefsRevision += 1;
+    try { localStorage.setItem(storageKey, JSON.stringify(notif.prefs)); } catch {}
+    renderNotificationSettings();
+  }
+
+  function notificationPushHint() {
+    if (!window.isSecureContext) {
+      return "Всплывающие баннеры и звук работают. Для фоновых Push на телефон и ПК откройте HTTPS-адрес.";
+    }
+    const ios = /iPhone|iPad|iPod/i.test(navigator.userAgent) ||
+      (/Macintosh/i.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+    if (ios && !navigator.standalone && !window.matchMedia("(display-mode: standalone)").matches) {
+      return "На iPhone добавьте сайт на экран «Домой», чтобы включить фоновые Push.";
+    }
+    if (!("serviceWorker" in navigator) || !("PushManager" in window) || !window.Notification) {
+      return "Этот браузер не поддерживает фоновые Push.";
+    }
+    if (window.Notification.permission === "denied") {
+      return "Разрешите уведомления для ZeroHub в настройках браузера.";
+    }
+    return "";
+  }
+
+  function renderNotificationSettings() {
+    if (!els.settingsNotificationsCard) return;
+    const notif = state.notifications;
+    for (const [key, id] of Object.entries(NOTIFICATION_CHECKBOXES)) {
+      els[id].checked = notif.prefs[key];
+    }
+    const hint = notificationPushHint();
+    els.notifDeviceHint.textContent = hint;
+    els.notifStatusPill.textContent = !notif.prefs.system_push ? "Push приостановлен"
+      : notif.currentDevicePushActive ? "Push подключён" : "Push не подключён";
+    els.notifTogglePushBtn.textContent = notif.currentDevicePushActive
+      ? "Отключить Push на этом устройстве" : "📲 Включить Push на этом устройстве";
+    els.notifTogglePushBtn.disabled = notif.busy || (!notif.currentDevicePushActive && Boolean(hint));
+    els.notifTestPushBtn.disabled = notif.busy || !notif.subscriptions.length;
+    els.notifDevicesList.replaceChildren();
+    for (const sub of notif.subscriptions) {
+      const chip = document.createElement("div");
+      chip.className = "notif-device-chip";
+      const name = document.createElement("span");
+      name.textContent = (sub.device_label || sub.endpoint) + (sub.id === notif.currentSubId ? " · это устройство" : "");
+      name.title = sub.last_error || sub.endpoint;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn btn-sm";
+      remove.textContent = "×";
+      remove.setAttribute("aria-label", "Отвязать " + name.textContent);
+      remove.dataset.notifSubId = sub.id;
+      remove.disabled = notif.busy;
+      chip.append(name, remove);
+      els.notifDevicesList.append(chip);
+    }
+  }
+
+  async function getNotificationRegistration() {
+    if (!navigator.serviceWorker?.getRegistration) return null;
+    return (await navigator.serviceWorker.getRegistration("/")) || null;
+  }
+
+  async function syncNotificationDevice() {
+    const notif = state.notifications;
+    const reg = await getNotificationRegistration();
+    const sub = await reg?.pushManager?.getSubscription();
+    let id = "";
+    if (sub && window.crypto?.subtle) {
+      const hash = await window.crypto.subtle.digest("SHA-256", new window.TextEncoder().encode(sub.endpoint));
+      const fingerprint = Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, "0")).join("");
+      id = notif.subscriptions.find(device => device.endpoint_fingerprint === fingerprint)?.id || "";
+    }
+    notif.currentSubId = id;
+    notif.currentDevicePushActive = Boolean(id);
+    renderNotificationSettings();
+  }
+
+  async function loadNotificationState() {
+    if (notificationRefresh) return notificationRefresh;
+    const revision = state.notifications.prefsRevision;
+    const token = state.token;
+    const request = (async () => {
+      const data = await apiFetch("/api/notifications/state");
+      if (state.token !== token) return;
+      if (revision === state.notifications.prefsRevision) applyNotificationPrefs(data.prefs);
+      state.notifications.subscriptions = data.subscriptions || [];
+      state.notifications.vapidPublicKey = data.vapid_public_key || "";
+      state.notifications.loaded = true;
+      await syncNotificationDevice();
+    })();
+    notificationRefresh = request;
+    try { await request; }
+    finally { if (notificationRefresh === request) notificationRefresh = null; }
+  }
+
+  function urlBase64ToUint8Array(value) {
+    const padded = value.padEnd(Math.ceil(value.length / 4) * 4, "=").replace(/-/g, "+").replace(/_/g, "/");
+    return Uint8Array.from(window.atob(padded), char => char.charCodeAt(0));
+  }
+
+  function notificationDeviceLabel() {
+    const ua = navigator.userAgent;
+    const os = /Android/i.test(ua) ? "Android" : /iPhone|iPod/i.test(ua) ? "iPhone"
+      : /iPad/i.test(ua) || (/Macintosh/i.test(ua) && navigator.maxTouchPoints > 1) ? "iPad"
+      : /Windows/i.test(ua) ? "Windows" : /Macintosh/i.test(ua) ? "macOS" : "Linux";
+    const browser = navigator.standalone || window.matchMedia("(display-mode: standalone)").matches ? "PWA"
+      : /Edg/i.test(ua) ? "Edge" : /Firefox|FxiOS/i.test(ua) ? "Firefox"
+      : /Chrome|CriOS/i.test(ua) ? "Chrome" : /Safari/i.test(ua) ? "Safari" : "Браузер";
+    return os + " · " + browser;
+  }
+
+  async function withNotificationDeviceAction(action) {
+    const notif = state.notifications;
+    if (notif.busy) return;
+    notif.busy = true;
+    renderNotificationSettings();
+    try { await action(); }
+    catch (err) { showToast(err.message || "Не удалось изменить настройки Push"); }
+    finally {
+      notif.busy = false;
+      renderNotificationSettings();
+    }
+  }
+
+  async function removeNotificationDevice(id) {
+    const notif = state.notifications;
+    const current = id === notif.currentSubId;
+    const res = await apiFetch("/api/notifications/push/unsubscribe", {
+      method: "POST", body: JSON.stringify({ sub_id: id }),
+    });
+    notif.subscriptions = res.subscriptions || [];
+    if (current) {
+      notif.currentSubId = "";
+      notif.currentDevicePushActive = false;
+      const reg = await getNotificationRegistration();
+      const sub = await reg?.pushManager?.getSubscription();
+      await sub?.unsubscribe();
+    }
+  }
+
+  async function toggleNotificationPush() {
+    await withNotificationDeviceAction(async () => {
+      const notif = state.notifications;
+      if (notif.currentSubId) {
+        await removeNotificationDevice(notif.currentSubId);
+        return;
+      }
+      if (notificationPushHint()) return;
+      if (await window.Notification.requestPermission() !== "granted") return;
+      if (!notif.loaded) await loadNotificationState();
+      if (notif.currentDevicePushActive) return;
+      const reg = await getNotificationRegistration();
+      if (!reg?.pushManager || !notif.vapidPublicKey) {
+        throw new Error("Подготовка Push ещё не завершилась. Попробуйте снова.");
+      }
+      // Renew a browser subscription whose server-side record was revoked.
+      const prior = await reg.pushManager.getSubscription();
+      if (prior) await prior.unsubscribe();
+      const sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(notif.vapidPublicKey),
+      });
+      try {
+        const res = await apiFetch("/api/notifications/push/subscribe", {
+          method: "POST", body: JSON.stringify({ ...sub.toJSON(), device_label: notificationDeviceLabel() }),
+        });
+        notif.subscriptions = res.subscriptions || [];
+        notif.currentSubId = res.current_sub_id || "";
+        notif.currentDevicePushActive = Boolean(notif.currentSubId);
+      } catch (err) {
+        await sub.unsubscribe().catch(() => {});
+        throw err;
+      }
+    });
+  }
+
+  function notificationAudioContext() {
+    const Audio = window.AudioContext || window.webkitAudioContext;
+    if (!notificationAudio && Audio) notificationAudio = new Audio();
+    return notificationAudio;
+  }
+
+  async function playNotificationSound(gesture = false) {
+    try {
+      const ctx = notificationAudioContext();
+      if (!ctx) return;
+      if (ctx.state === "suspended" && gesture) await ctx.resume();
+      if (ctx.state !== "running") return;
+      for (const [offset, hz] of [[0, 523], [0.13, 659]]) {
+        const at = ctx.currentTime + offset + 0.01;
+        const tone = ctx.createOscillator();
+        const gain = ctx.createGain();
+        tone.frequency.value = hz;
+        gain.gain.setValueAtTime(0.001, at);
+        gain.gain.exponentialRampToValueAtTime(0.08, at + 0.025);
+        gain.gain.exponentialRampToValueAtTime(0.001, at + 0.16);
+        tone.connect(gain);
+        gain.connect(ctx.destination);
+        tone.onended = () => { tone.disconnect(); gain.disconnect(); };
+        tone.start(at);
+        tone.stop(at + 0.17);
+      }
+    } catch {}
+  }
+
+  function sendClientFocus() {
+    if (state.ws?.readyState !== WebSocket.OPEN) return;
+    try {
+      state.ws.send(JSON.stringify({
+        action: "client_focus",
+        visible: !document.hidden && document.hasFocus(),
+        active_chat_id: state.viewingDesktopConv ? "" : String(state.activeChatId || ""),
+      }));
+    } catch {}
+  }
+
+  function queueClientFocus() {
+    clearTimeout(notificationFocusTimer);
+    notificationFocusTimer = setTimeout(sendClientFocus, 300);
+  }
+
+  function claimNotificationEvent(eventKey) {
+    const key = resolveActiveUsername() + ":" + eventKey;
+    const storageKey = "agy_hub_notif_dedup";
+    const now = Date.now();
+    let saved = recentNotificationEvents;
+    try {
+      const stored = JSON.parse(localStorage.getItem(storageKey) || "null");
+      if (Array.isArray(stored)) saved = stored;
+    } catch {}
+    const recent = saved.filter(item => Array.isArray(item) && now - Number(item[1]) < 60000);
+    if (recent.some(item => item[0] === key)) return false;
+    recentNotificationEvents = [...recent.slice(-29), [key, now]];
+    try { localStorage.setItem(storageKey, JSON.stringify(recentNotificationEvents)); } catch {}
+    return true;
+  }
+
+  async function openNotificationTarget(data) {
+    if (data?.chat_id) await openHubChat(String(data.chat_id));
+    else if (data?.kind === "process_crash" && data.project_name) {
+      await openHostServicesModal(String(data.project_name), "project");
+    }
+  }
+
+  async function openNotificationQuery() {
+    const params = new URLSearchParams(window.location.search);
+    const chatId = params.get("open_chat");
+    const projectName = params.get("open_processes");
+    if (!chatId && !projectName) return;
+    params.delete("open_chat");
+    params.delete("open_processes");
+    const query = params.toString();
+    window.history.replaceState({}, "", window.location.pathname + (query ? "?" + query : "") + window.location.hash);
+    await openNotificationTarget({ chat_id: chatId, project_name: projectName, kind: "process_crash" });
+  }
+
+  async function showRealtimeNotification({ eventKey, title, body, tone, tag, data }) {
+    const prefs = state.notifications.prefs;
+    const visible = !document.hidden;
+    const toast = visible && prefs.in_app_toast;
+    const system = (!visible || !document.hasFocus()) && prefs.system_push
+      && !state.notifications.currentDevicePushActive && window.Notification?.permission === "granted";
+    if (!toast && !prefs.sound && !system) return;
+
+    // Give the visible tab first chance to show the actionable banner.
+    if (!visible) await new Promise(resolve => setTimeout(resolve, 350));
+    const notify = async () => {
+      if (!claimNotificationEvent(eventKey)) return;
+      const open = () => { void openNotificationTarget(data).catch(() => {}); };
+      if (toast) showToast(title + " · " + body, 6000, { label: "Открыть ↗", onClick: open, tone });
+      if (prefs.sound) void playNotificationSound();
+      if (system) {
+        await notificationRefresh?.catch(() => {});
+        if (state.notifications.currentDevicePushActive || !state.notifications.prefs.system_push) return;
+        const opts = { body, icon: "/static/icon-192.png", tag, data };
+        try {
+          const reg = await getNotificationRegistration();
+          if (reg?.active) await reg.showNotification(title, opts);
+          else {
+            const notice = new window.Notification(title, opts);
+            notice.onclick = () => { notice.close(); window.focus(); open(); };
+          }
+        } catch {}
+      }
+    };
+    if (navigator.locks?.request) {
+      try {
+        await navigator.locks.request("agy_hub_notif_dedup", notify);
+        return;
+      } catch {}
+    }
+    await notify();
+  }
+
+  function notifyTurnEvent(kind, evt, chatId) {
+    if (!isChatInBackgroundForRadar(chatId)) return;
+    const prefs = state.notifications.prefs;
+    if (!prefs["on_" + kind]) return;
+    const duration = Number(evt.message?.usage?.last_run_duration_ms || 0);
+    const done = kind === "turn_done";
+    if (done && prefs.only_long_turns && duration < 15000) return;
+    const chat = evt.chat || findChatObjectAnywhere(chatId) || {};
+    const title = [chat.project_name, chat.title].filter(Boolean).join(" · ") || "Диалог";
+    const body = done ? "Задача завершена" + (duration ? " · " + Math.max(1, Math.round(duration / 1000)) + " с" : "")
+      : "Ошибка генерации";
+    void showRealtimeNotification({
+      eventKey: [kind, chatId, evt.message?.id, evt.chat?.last_terminal_ts_ms || evt.message?.updated_at].join(":"),
+      title, body, tone: done ? "done" : "warn", tag: "zerohub-chat-" + chatId,
+      data: { kind, chat_id: chatId, url: "/?open_chat=" + encodeURIComponent(chatId) },
+    }).catch(() => {});
+  }
+
+  function notifyProcessCrash(project, svc) {
+    if (!state.notifications.prefs.on_process_crash) return;
+    const kind = "process_crash";
+    const body = "Фоновый процесс завершился со сбоем" + (svc.exit_code == null ? "" : " (exit " + svc.exit_code + ")");
+    void showRealtimeNotification({
+      eventKey: [kind, project, svc.name, svc.started_at, svc.pid, svc.exit_code].join(":"),
+      title: (project || "Проект") + " · " + svc.name, body, tone: "error",
+      tag: "zerohub-proc-" + project + "-" + svc.name,
+      data: { kind, project_name: project, url: "/?open_processes=" + encodeURIComponent(project) },
+    }).catch(() => {});
+  }
+
+  function bindNotificationEvents() {
+    if (!els.settingsNotificationsCard) return;
+    for (const [key, id] of Object.entries(NOTIFICATION_CHECKBOXES)) {
+      els[id].addEventListener("change", event => {
+        const checked = event.target.checked;
+        const token = state.token;
+        notificationPrefsQueue = notificationPrefsQueue.then(async () => {
+          if (state.token !== token) return;
+          const res = await apiFetch("/api/notifications/prefs", {
+            method: "PUT", body: JSON.stringify({ [key]: checked }),
+          });
+          if (state.token === token) applyNotificationPrefs(res.notification_prefs);
+        }).catch(err => {
+          renderNotificationSettings();
+          showToast(err.message || "Не удалось сохранить уведомления");
+        });
+      });
+    }
+    els.notifTogglePushBtn.addEventListener("click", toggleNotificationPush);
+    els.notifTestSoundBtn.addEventListener("click", () => { void playNotificationSound(true); });
+    els.notifDevicesList.addEventListener("click", event => {
+      const id = event.target.closest("[data-notif-sub-id]")?.dataset.notifSubId;
+      if (id) void withNotificationDeviceAction(() => removeNotificationDevice(id));
+    });
+    els.notifTestPushBtn.addEventListener("click", () => withNotificationDeviceAction(async () => {
+      const counts = await apiFetch("/api/notifications/push/test", { method: "POST" });
+      showToast("Доставлено: " + counts.sent_count + " · ошибок: " + counts.failed_count);
+      await loadNotificationState();
+    }));
+    document.addEventListener("visibilitychange", queueClientFocus);
+    window.addEventListener("focus", () => {
+      queueClientFocus();
+      if (state.currentUser && state.notifications.loaded && !state.notifications.busy) {
+        void loadNotificationState().catch(() => {});
+      }
+    });
+    window.addEventListener("blur", queueClientFocus);
+    document.addEventListener("pointerdown", () => {
+      if (!state.notifications.prefs.sound) return;
+      try {
+        const ctx = notificationAudioContext();
+        if (ctx?.state === "suspended") void ctx.resume().catch(() => {});
+      } catch {}
+    });
+    navigator.serviceWorker?.addEventListener("message", event => {
+      if (event.data?.type !== "zerohub_notification_click") return;
+      if (state.currentUser) void openNotificationTarget(event.data).catch(() => {});
+      else pendingNotificationTarget = event.data;
+    });
+  }
+
   async function openSettingsModal(initialTab) {
     const [sys, rulesResp] = await Promise.all([
       apiFetch("/api/system/info"),
@@ -31211,8 +32265,11 @@
       els.gdriveSettingsCard.classList.add("hidden");
     }
     const tab = typeof initialTab === "string" && initialTab ? initialTab : state.settingsActiveTab;
+    hideMsgSelectionToolbar();
     els.settingsModal.classList.remove("hidden");
     switchSettingsTab(tab);
+    applyNotificationPrefs(sys.user?.notification_prefs);
+    void loadNotificationState().catch(() => {});
     void loadUpdatesStatus();
   }
 
@@ -31657,7 +32714,9 @@
 
   function bindUpdatesEvents() {
     if (!$("updatesModal")) return;
-    $("pubShieldNotice").insertAdjacentHTML("afterbegin", window.AgyUI?.icon("shieldCheck", "ui-ico-xs") || "");
+    if (typeof $("pubShieldNotice")?.insertAdjacentHTML === "function") {
+      $("pubShieldNotice").insertAdjacentHTML("afterbegin", window.AgyUI?.icon("shieldCheck", "ui-ico-xs") || "");
+    }
     $("updatesSettingsHint").classList.add("upd-settings-hint");
     els.sidebarVersionBadge.addEventListener("click", () => {
       closeMobileSidebar();
@@ -34235,7 +35294,7 @@
         const key = btn.dataset.hubProviderTab;
         if (key === "agy") {
           btn.textContent = agyCount > 0 ? `Google AI (${agyCount})` : "Google AI";
-          btn.classList.toggle("hidden", !admin && inQuota === false ? false : false);
+          btn.classList.remove("hidden");
         } else if (key === "claude") {
           btn.textContent = claudeCount > 0 ? `Claude Code (${claudeCount})` : "Claude Code";
         } else if (key === "chatgpt") {
@@ -36282,6 +37341,7 @@
     const hasCg = Boolean(cgSum && cgSum.has_account);
     const cgEnabled = Boolean(hasCg && cgSum.is_enabled);
     if (els.mobChatGptPillBtn && els.mobChatGptDot && els.mobChatGptText) {
+      els.mobChatGptPillBtn.classList.toggle("is-configured", hasCg);
       els.mobChatGptPillBtn.classList.remove("is-low", "is-warn", "is-paused");
       els.mobChatGptDot.className = "mob-telem-dot is-cgpt";
       if (!hasCg) {
@@ -36320,6 +37380,7 @@
     const hasKey = Boolean(sum && sum.has_key);
     const enabled = Boolean(hasKey && sum.is_enabled);
     if (els.mobOrPillBtn && els.mobOrDot && els.mobOrText) {
+      els.mobOrPillBtn.classList.toggle("is-configured", hasKey);
       els.mobOrPillBtn.classList.remove("is-low", "is-warn", "is-paused");
       els.mobOrDot.className = "mob-telem-dot is-or";
 
@@ -36409,6 +37470,15 @@
           "Персональный шлюз OpenRouter";
       }
     }
+
+    const claudeSum = state.claude && state.claude.summary;
+    const hasClaude = Boolean(claudeSum && claudeSum.has_account);
+    const mobClaudeBtn = $("mobClaudePillBtn");
+    if (mobClaudeBtn) {
+      mobClaudeBtn.classList.toggle("is-configured", hasClaude);
+    }
+    const configuredCount = 1 + (hasCg ? 1 : 0) + (hasClaude ? 1 : 0) + (hasKey ? 1 : 0);
+    els.mobileTelemetryBar.setAttribute("data-configured-count", String(configuredCount));
 
     syncMobileTelemetryExpandedUI();
   }
@@ -42658,13 +43728,62 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     return null;
   }
 
+  const LIVE_VOICE_WS_BACKOFF_MS = [500, 1000, 2000, 5000];
+
+  function syncLiveVoiceCanvasSize() {
+    const lc = state.liveCall;
+    const canvas = els.liveVoiceWaveCanvas;
+    if (!lc || !canvas) return;
+    lc.canvasCssW = Math.max(72, Math.round(canvas.clientWidth || 132));
+    lc.canvasCssH = Math.max(20, Math.round(canvas.clientHeight || 28));
+  }
+
+  function stopLiveVoiceCanvasSizeObserver() {
+    const lc = state.liveCall;
+    if (!lc) return;
+    if (lc.canvasResizeObserver) {
+      try {
+        lc.canvasResizeObserver.disconnect();
+      } catch {}
+      lc.canvasResizeObserver = null;
+    }
+    if (lc.canvasResizeHandler) {
+      try {
+        window.removeEventListener("resize", lc.canvasResizeHandler);
+      } catch {}
+      lc.canvasResizeHandler = null;
+    }
+  }
+
+  function startLiveVoiceCanvasSizeObserver() {
+    const lc = state.liveCall;
+    const canvas = els.liveVoiceWaveCanvas;
+    stopLiveVoiceCanvasSizeObserver();
+    syncLiveVoiceCanvasSize();
+    if (!lc) return;
+    if (canvas && typeof ResizeObserver === "function") {
+      try {
+        const ro = new ResizeObserver(() => {
+          syncLiveVoiceCanvasSize();
+        });
+        ro.observe(canvas);
+        lc.canvasResizeObserver = ro;
+      } catch {}
+    }
+    const onResize = () => syncLiveVoiceCanvasSize();
+    lc.canvasResizeHandler = onResize;
+    try {
+      window.addEventListener("resize", onResize, { passive: true });
+    } catch {}
+  }
+
   function drawLiveVoiceCanvasFrame() {
     const lc = state.liveCall;
     const canvas = els.liveVoiceWaveCanvas;
     if (!canvas || !lc.waveBars) return;
     const dpr = Math.min(window.devicePixelRatio || 1, 3);
-    const cssW = Math.max(72, Math.round(canvas.clientWidth || 132));
-    const cssH = Math.max(20, Math.round(canvas.clientHeight || 28));
+    const cssW = Math.max(72, Math.round(lc.canvasCssW || 132));
+    const cssH = Math.max(20, Math.round(lc.canvasCssH || 28));
     const targetW = Math.round(cssW * dpr);
     const targetH = Math.round(cssH * dpr);
     if (canvas.width !== targetW || canvas.height !== targetH) {
@@ -42732,6 +43851,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     }
     lc.waveBars = new Float32Array(LIVE_WAVE_BAR_COUNT).fill(0.05);
     lc.waveTargets = new Float32Array(LIVE_WAVE_BAR_COUNT).fill(0.05);
+    startLiveVoiceCanvasSizeObserver();
 
     const micBuf = lc.micAnalyser ? new Uint8Array(lc.micAnalyser.fftSize) : null;
     const spkBuf = () =>
@@ -42828,7 +43948,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
 
   function openLiveCallVoiceWebSocket(mySessionId) {
     const lc = state.liveCall;
-    if (!lc.active || lc.sessionId !== mySessionId) return;
+    if (!lc.active || lc.sessionId !== mySessionId || !state.token) return;
 
     if (lc.voiceWs) {
       try {
@@ -42863,6 +43983,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
         return;
       }
       lc.wsConnected = true;
+      lc.wsReconnectAttempts = 0;
       const modelChoice =
         state.voice.model === "fast" ? "gigaam-v3-e2e-ctc" : "gigaam-v3-e2e-rnnt";
       try {
@@ -42939,11 +44060,18 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       if (!lc.active || lc.sessionId !== mySessionId || lc.voiceWs !== ws) return;
       lc.wsConnected = false;
       clearTimeout(lc.wsReconnectTimer);
+      lc.wsReconnectTimer = null;
+      if (!state.token) return;
+      const attempt = Math.max(0, Number(lc.wsReconnectAttempts) || 0);
+      const delayMs =
+        LIVE_VOICE_WS_BACKOFF_MS[Math.min(attempt, LIVE_VOICE_WS_BACKOFF_MS.length - 1)];
+      lc.wsReconnectAttempts = attempt + 1;
       lc.wsReconnectTimer = setTimeout(() => {
-        if (lc.active && lc.sessionId === mySessionId) {
+        lc.wsReconnectTimer = null;
+        if (lc.active && lc.sessionId === mySessionId && state.token) {
           openLiveCallVoiceWebSocket(mySessionId);
         }
-      }, 500);
+      }, delayMs);
     };
 
     ws.onerror = () => {};
@@ -43191,6 +44319,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     const mySessionId = `lv_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
     lc.active = true;
     lc.sessionId = mySessionId;
+    lc.wsReconnectAttempts = 0;
     lc.muted = false;
     lc.chatId = state.activeChatId || "";
     lc.serverLiveCallReady = false;
@@ -43284,9 +44413,10 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
 
   function stopLiveVoiceCall(opts = {}) {
     const lc = state.liveCall;
-    if (!lc.active && !lc.micStream && !lc.voiceWs) return;
+    if (!lc.active && !lc.micStream && !lc.voiceWs && !lc.playbackCtx) return;
     lc.active = false;
     lc.sessionId = "";
+    lc.wsReconnectAttempts = 0;
     lc.muted = false;
     lc.awaitingTurnResponse = false;
     lc.liveTtsDoneForTurn = true;
@@ -43307,6 +44437,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       cancelAnimationFrame(lc.rafId);
       lc.rafId = null;
     }
+    stopLiveVoiceCanvasSizeObserver();
 
     stopAllLiveTtsPlayback({ markCooldown: false });
 
@@ -43346,6 +44477,14 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       lc.micAudioCtx = null;
     }
     lc.micAnalyser = null;
+    if (lc.playbackCtx) {
+      try {
+        lc.playbackCtx.close();
+      } catch {}
+      lc.playbackCtx = null;
+    }
+    lc.playbackGain = null;
+    lc.playbackAnalyser = null;
 
     releaseLiveWakeLock();
 
@@ -43578,6 +44717,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
   }
 
   function bindEvents() {
+    bindNotificationEvents();
     els.themeToggleBtn.addEventListener("click", toggleTheme);
     if (els.refreshAppBtn) {
       els.refreshAppBtn.addEventListener("click", (e) => {
@@ -44978,6 +46118,10 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     };
 
     const positionMsgSelectionToolbar = (safeRange) => {
+      if (hasOpenModalBackdrop()) {
+        hideMsgSelectionToolbar();
+        return;
+      }
       if (!els.msgSelectionToolbar || !els.messagesContainer || !safeRange) {
         hideMsgSelectionToolbar();
         return;
@@ -45061,6 +46205,10 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     };
 
     const refreshMsgSelectionToolbarFromLiveSelection = () => {
+      if (hasOpenModalBackdrop()) {
+        hideMsgSelectionToolbar();
+        return;
+      }
       if (isSelectingInMessages) return;
       const sel = window.getSelection ? window.getSelection() : null;
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
@@ -45078,6 +46226,8 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
           ? safeRange.commonAncestorContainer
           : safeRange.commonAncestorContainer.parentElement;
       if (anc && anc.closest && anc.closest(".thinking-content")) {
+        if (els.quoteSelectionQuickBtn) els.quoteSelectionQuickBtn.classList.add("hidden");
+        if (els.copySelectionQuickBtn) els.copySelectionQuickBtn.classList.add("hidden");
         hideMsgSelectionToolbar();
         return;
       }
@@ -45086,6 +46236,22 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
         hideMsgSelectionToolbar();
         return;
       }
+      const row = resolveRowFromRange(safeRange, anc);
+      lastActiveMsgSelection = {
+        msgId: row ? String(row.dataset.msgId || "") : "",
+        text: payload.text,
+        html: payload.html,
+        ts: Date.now(),
+      };
+      if (els.quoteSelectionQuickBtn) {
+        els.quoteSelectionQuickBtn.classList.toggle(
+          "hidden",
+          Boolean(state.viewingDesktopConv)
+        );
+      }
+      if (els.copySelectionQuickBtn) {
+        els.copySelectionQuickBtn.classList.remove("hidden");
+      }
       positionMsgSelectionToolbar(safeRange);
     };
 
@@ -45093,6 +46259,10 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       if (selToolbarIdleTimer) {
         clearTimeout(selToolbarIdleTimer);
         selToolbarIdleTimer = null;
+      }
+      if (hasOpenModalBackdrop()) {
+        hideMsgSelectionToolbar();
+        return;
       }
       const sel = window.getSelection ? window.getSelection() : null;
       if (!sel || sel.isCollapsed || sel.rangeCount === 0) {
@@ -45157,6 +46327,12 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
         };
       }
 
+      // Avoid expensive DOM cloning & COPY_STRIP_SELECTOR queries on every drag pixel;
+      // defer clipboard serialization to pointerup / touchend / idle settle.
+      if (isSelectingInMessages) {
+        return;
+      }
+
       const safeRange = getSafeClampedMessageRange(rawRange);
       const anc =
         safeRange.commonAncestorContainer.nodeType === Node.ELEMENT_NODE
@@ -45168,33 +46344,10 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
         hideMsgSelectionToolbar();
         return;
       }
-      const payload = serializeRangeForClipboard(safeRange);
-      if (payload.text) {
-        const row = resolveRowFromRange(safeRange, anc);
-        lastActiveMsgSelection = {
-          msgId: row ? String(row.dataset.msgId || "") : "",
-          text: payload.text,
-          html: payload.html,
-          ts: Date.now(),
-        };
-        if (els.quoteSelectionQuickBtn) {
-          els.quoteSelectionQuickBtn.classList.toggle(
-            "hidden",
-            Boolean(state.viewingDesktopConv)
-          );
-        }
-        if (els.copySelectionQuickBtn) {
-          els.copySelectionQuickBtn.classList.remove("hidden");
-        }
-        if (!isSelectingInMessages) {
-          selToolbarIdleTimer = setTimeout(() => {
-            selToolbarIdleTimer = null;
-            refreshMsgSelectionToolbarFromLiveSelection();
-          }, 120);
-        }
-      } else {
-        hideMsgSelectionToolbar();
-      }
+      selToolbarIdleTimer = setTimeout(() => {
+        selToolbarIdleTimer = null;
+        refreshMsgSelectionToolbarFromLiveSelection();
+      }, 120);
     });
 
     els.messagesList.addEventListener(
@@ -45430,12 +46583,14 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       clearLiveWindowSelection();
     });
 
-    document.addEventListener("pointerup", () => {
+    const finishSelectingInMessages = () => {
       if (isSelectingInMessages) {
         isSelectingInMessages = false;
         requestAnimationFrame(refreshMsgSelectionToolbarFromLiveSelection);
       }
-    });
+    };
+    document.addEventListener("pointerup", finishSelectingInMessages);
+    document.addEventListener("touchend", finishSelectingInMessages, { passive: true });
     document.addEventListener("pointercancel", () => {
       isSelectingInMessages = false;
     });
@@ -45680,7 +46835,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
 
       const copyCodeBtn = e.target.closest(".copy-code-btn");
       if (copyCodeBtn) {
-        const code = decodeURIComponent(copyCodeBtn.dataset.code || "");
+        const code = extractCodeTextFromCopyButton(copyCodeBtn);
         await writeFormattedClipboard({
           text: code,
           html: `<pre><code>${escapeHtml(code)}</code></pre>`,
@@ -48400,11 +49555,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     if (els.mobOrPillBtn) {
       els.mobOrPillBtn.addEventListener("click", () => openOpenRouterModal("config"));
     }
-    if (els.mobTelemetryExpandBtn) {
-      els.mobTelemetryExpandBtn.addEventListener("click", () => {
-        setMobileTelemetryExpanded(!state.mobTelemetryExpanded);
-      });
-    }
+    bindTelemetryDockEvents();
     if (els.refreshQuotasBtn) {
       els.refreshQuotasBtn.addEventListener("click", async () => {
         els.refreshQuotasBtn.disabled = true;
@@ -49716,10 +50867,25 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       }
       state.activeChatId = null;
       state.activeChat = null;
+      state.chats = [];
+      state.projects = [];
+      state.folders = [];
+      state.desktopConvs = [];
       state.messages = [];
-      if (state.liveCall && state.liveCall.active) {
-        stopLiveVoiceCall({ silent: true });
+      if (state.quotaRefreshTimer) {
+        clearTimeout(state.quotaRefreshTimer);
+        state.quotaRefreshTimer = null;
       }
+      if (state.telemetryCountdownTimer) {
+        clearInterval(state.telemetryCountdownTimer);
+        state.telemetryCountdownTimer = null;
+      }
+      stopAgyOAuthPolling({ clearFlow: true });
+      stopHostServiceLiveTail();
+      if (state.voice && (state.voice.recording || state.voice.transcribing)) {
+        cancelVoiceRecording();
+      }
+      stopLiveVoiceCall({ silent: true });
       state.liveCall.prefsLoadedKey = "";
       state.outline.lastChatKey = "";
       state.outline.isOpen = false;
@@ -49772,6 +50938,7 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       clearTimeout(state.justFinishedHeaderTimer);
       state.justFinishedHeaderTimer = null;
       state.activitySectionCollapsed = false;
+      state.telemetryDockMode = "auto";
       state.mobTelemetryExpanded = false;
       syncActivitySectionCollapsedUI();
       syncMobileTelemetryExpandedUI();
@@ -49822,7 +50989,10 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       closeHandoffNewTabModal();
       state.wsOutboundQueue = [];
       state.wsEverConnected = false;
+      clearTimeout(state.wsReconnectTimer);
+      state.wsReconnectTimer = null;
       clearInterval(state.wsPingTimer);
+      stopLiveAssistantElapsedTimer();
       state.wsPingTimer = null;
       clearWsPongWatchdog();
       try {
@@ -49832,7 +51002,16 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
         localStorage.removeItem("agy_hub_active_user_id");
       } catch {}
       els.settingsModal.classList.add("hidden");
-      if (state.ws) state.ws.close();
+      if (state.ws) {
+        try {
+          state.ws.onopen = null;
+          state.ws.onclose = null;
+          state.ws.onmessage = null;
+          state.ws.onerror = null;
+          state.ws.close();
+        } catch {}
+        state.ws = null;
+      }
       resetToNewChatDraft({ preserveLastActive: true });
       showLoginScreen();
     });
@@ -49848,9 +51027,11 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     document.addEventListener("visibilitychange", () => {
       if (document.hidden) {
         lastHiddenAt = Date.now();
+        stopLiveAssistantElapsedTimer();
         saveCurrentComposerDraft();
         saveActiveChatSnapshotNow();
       } else {
+        syncLiveAssistantElapsedDom();
         handleAppForegroundResume("visibility");
       }
     });
@@ -51919,6 +53100,8 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     applyAppearance({ mode: state.themeMode, palette: state.palette });
     setupMarkdown();
     bindEvents();
+    syncMobileTelemetryExpandedUI();
+    syncMobileTelemetryBar();
     try {
       bindClaudeEvents();
     } catch (e) {
@@ -52003,14 +53186,22 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
     renderSidebarSafe("current");
   }
 
+  bindModalBackdropSelectionGuard();
+
   if (
     (typeof globalThis !== "undefined" && globalThis.__AGY_EXPORT_ADVISOR_FOR_TESTS__) ||
     (typeof window !== "undefined" && window.__AGY_EXPORT_ADVISOR_FOR_TESTS__)
   ) {
     const exportedAdvisorApi = {
+      applyNotificationPrefs,
+      bindNotificationEvents,
+      loadNotificationState,
+      notifyTurnEvent,
+      openNotificationTarget,
+      toggleNotificationPush,
       resolveRecentOrActiveProjectName, startRegularChatDraft, startProjectBranchDraft,
       switchWelcomeDraftContext, syncPrimaryNewButtonUI, renderWelcomeContextSwitch,
-      applyChatHeaderState, renderUnifiedSidebar, resetToNewChatDraft,
+      applyChatHeaderState, resetToNewChatDraft,
       stripTaskProfileFromText,
       stripInterruptBannerFromContent,
       stripFalseTrailingLocationBanner,
@@ -52019,10 +53210,20 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       deriveLatestAssistantStatusFromMessages,
       resolveOpenChatLiveState,
       syncActiveChatHeaderStatus,
+      fastTextHash32,
+      computeAssistantToolsSig,
       describeAssistantSlot,
       buildAssistantInnerHtml,
       buildMessageDom,
       setupMarkdown,
+      renderMarkdownSafe,
+      isSafeExternalHref,
+      getHljsCacheSize,
+      clearHljsCache,
+      extractCodeTextFromCopyButton,
+      isUserChatUploadMediaRef,
+      DELIVERABLE_FILE_EXT_RE,
+      renderGeneratedFileCard,
       isResumableAssistantMessage,
       continueInterruptedTurn,
       extractTaskProfileFromText,
@@ -52037,11 +53238,9 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       evaluateComposerModelSkew,
       normalizeAdvisorPrefsClient,
       getAdvisorShortVendorName,
-      classifyModelVendor,
       extractClaudeQuotasPair,
       extractChatGptQuotasPair,
       buildCodeHandoffPrompt,
-      findTargetHqChatForReturn,
       buildExecutionFactSummaryFromMsg,
       buildReturnToHqPrompt,
       togglePendingHqReturnMode,
@@ -52054,7 +53253,6 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       mergeHqReturnLists,
       buildMessageHqReturnsHtml,
       resolveSiblingChatIdByTitle,
-      parseForwardedEnvelope,
       extractCleanUserTurnBody,
       stripConversationalLeadIn,
       isGenericMetaQuestionClause,
@@ -52110,7 +53308,14 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       formatProcessDurationShort,
       buildProcessErrorPromptText,
       extractPinExcerptFromMessage,
+      buildAssistantHeaderInnerHtml,
       buildAssistantFooterInnerHtml,
+      formatTurnDuration,
+      formatLiveStreamElapsed,
+      syncLiveAssistantElapsedDom,
+      stopLiveAssistantElapsedTimer,
+      updateSingleAssistantDom,
+      buildClipboardPayloadFromElement,
       findTargetHqChatForReturn,
       hasAnyHqReturnSentFromChat,
       computeSidebarChatVisualSig,
@@ -52138,12 +53343,17 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       sortAndFilterAccountsList,
       renderAgyPool,
       estimateDraftTokens,
+      formatCompactTokens,
       syncSecurityModeUI,
       syncAccessSelectStyle,
       syncHostServicesHeaderIndicator,
       canUserMutateProjectGit,
       isSelfHubProject,
       askUserConfirm,
+      hasOpenModalBackdrop,
+      hideMsgSelectionToolbar,
+      connectWebSocket,
+      openLiveCallVoiceWebSocket,
       triggerServerRestart,
       syncHandoffGitCheckpointUI,
       openHandoffNewTabModal,
@@ -52228,6 +53438,12 @@ registerProcessor("hub-pcm16-proc", HubPcm16Processor);
       clearAllUnreadCompleted,
       syncBackgroundAlertsUI,
       syncSidebarFilterBarBadges,
+      loadTelemetryDockMode,
+      resolveTelemetryDockExpanded,
+      setTelemetryDockMode,
+      syncMobileTelemetryExpandedUI,
+      syncMobileTelemetryBar,
+      bindTelemetryDockEvents,
       renderUnifiedSidebar,
       handleWsEvent,
       handleCrossTabUnreadStorageEvent,

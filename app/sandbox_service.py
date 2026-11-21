@@ -46,11 +46,12 @@ _CONTAINER_STARTED_MONO: dict[str, float] = {}
 _CONTAINER_META: dict[str, dict[str, str]] = {}
 _CONTAINER_LOCKS: dict[str, asyncio.Lock] = {}
 _REAPER_TASK: Optional[asyncio.Task[None]] = None
-_SANDBOX_PROCESSES_NOTIFIER: Optional[Callable[[str, Path, str], Awaitable[None]]] = None
+_SANDBOX_PROCESSES_NOTIFIER: Optional[Callable[..., Awaitable[None]]] = None
+_SANDBOX_WATCHED_SERVICES: dict[str, dict[str, tuple[str, Path, str, str]]] = {}
 
 
 def set_sandbox_processes_notifier(
-    cb: Optional[Callable[[str, Path, str], Awaitable[None]]],
+    cb: Optional[Callable[..., Awaitable[None]]],
 ) -> None:
     global _SANDBOX_PROCESSES_NOTIFIER
     _SANDBOX_PROCESSES_NOTIFIER = cb
@@ -60,12 +61,15 @@ def _schedule_sandbox_processes_notify(
     project_name: str,
     project_dir: Path,
     user_id: str,
+    transition: Optional[dict[str, Any]] = None,
 ) -> None:
     if _SANDBOX_PROCESSES_NOTIFIER is None or not project_name:
         return
     try:
         loop = asyncio.get_running_loop()
-        loop.create_task(_SANDBOX_PROCESSES_NOTIFIER(project_name, project_dir.resolve(), user_id))
+        args = (project_name, project_dir.resolve(), user_id)
+        call = _SANDBOX_PROCESSES_NOTIFIER(*args, transition) if transition else _SANDBOX_PROCESSES_NOTIFIER(*args)
+        loop.create_task(call)
     except Exception:
         pass
 
@@ -806,6 +810,12 @@ def _get_container_lock(container_name: str) -> asyncio.Lock:
     return lock
 
 
+def _discard_container_lock(container_name: str) -> None:
+    lock = _CONTAINER_LOCKS.get(container_name)
+    if lock is not None and not lock.locked():
+        _CONTAINER_LOCKS.pop(container_name, None)
+
+
 async def _run_docker_short(args: list[str], *, timeout: float = 20.0) -> tuple[int, str, str]:
     docker_bin = config.resolve_docker_bin()
     if not docker_bin:
@@ -826,7 +836,22 @@ async def _run_docker_short(args: list[str], *, timeout: float = 20.0) -> tuple[
                 proc.kill()
             except ProcessLookupError:
                 pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except Exception:
+                pass
             return (124, "", "Превышен таймаут обращения к Docker CLI")
+        except asyncio.CancelledError:
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except BaseException:
+                pass
+            raise
         return (
             proc.returncode if proc.returncode is not None else 1,
             out_b.decode("utf-8", errors="replace").strip(),
@@ -1068,6 +1093,7 @@ async def stop_user_sandboxes(user_id: str) -> int:
         rm_rc, _, _ = await _run_docker_short(["rm", "-f", name], timeout=15.0)
         _CONTAINER_LAST_USED.pop(name, None)
         _CONTAINER_META.pop(name, None)
+        _discard_container_lock(name)
         _cleanup_sandbox_uploads_host_dir(name)
         if rm_rc == 0:
             removed += 1
@@ -1115,6 +1141,7 @@ async def stop_project_sandboxes(
         rm_rc, _, _ = await _run_docker_short(["rm", "-f", name], timeout=15.0)
         _CONTAINER_LAST_USED.pop(name, None)
         _CONTAINER_META.pop(name, None)
+        _discard_container_lock(name)
         _cleanup_sandbox_uploads_host_dir(name)
         if rm_rc == 0:
             removed += 1
@@ -1187,6 +1214,32 @@ async def _seed_managed_containers() -> None:
         _CONTAINER_STARTED_MONO.setdefault(name, now)
 
 
+async def _check_sandbox_service_crashes(container_name: str) -> None:
+    tracked = _SANDBOX_WATCHED_SERVICES.get(container_name)
+    if not tracked:
+        return
+    uid, project_dir, project_name, _ = next(iter(tracked.values()))
+    snapshot = dict(tracked)
+    views = await list_project_sandbox_services(uid, project_dir, project_name, running_containers={container_name})
+    for view in views:
+        name = _sanitize_sandbox_service_name(view["name"])
+        record = snapshot.get(name)
+        if not record or tracked.get(name) is not record or record[3] != view["started_at"] or view["alive"]:
+            continue
+        tracked.pop(name)
+        if view["status"] == "crashed":
+            error_tail = ""
+            try:
+                logs = await get_project_sandbox_service_logs(uid, project_dir, project_name, name, tail_lines=10)
+                if logs.get("started_at") == view["started_at"]:
+                    error_tail = str(logs.get("log_tail") or "")
+            except (OSError, RuntimeError):
+                pass
+            _schedule_sandbox_processes_notify(project_name, project_dir, uid, {
+                "transition": "crashed", "service": view, "error_tail": error_tail,
+            })
+
+
 async def reap_idle_sandboxes_once() -> int:
     rc, out, _ = await _run_docker_short(
         [
@@ -1212,7 +1265,11 @@ async def reap_idle_sandboxes_once() -> int:
         parts = line.split("|", 1)
         name = parts[0].strip()
         state_str = parts[1].strip().lower() if len(parts) > 1 else ""
-        if not name or name in busy_names:
+        if not name:
+            continue
+        if state_str == "running":
+            await _check_sandbox_service_crashes(name)
+        if name in busy_names:
             continue
         last_used = _CONTAINER_LAST_USED.get(name)
         if last_used is None:
@@ -1231,6 +1288,8 @@ async def reap_idle_sandboxes_once() -> int:
             _CONTAINER_LAST_USED.pop(name, None)
             _CONTAINER_STARTED_MONO.pop(name, None)
             _CONTAINER_META.pop(name, None)
+            _SANDBOX_WATCHED_SERVICES.pop(name, None)
+            _discard_container_lock(name)
             _cleanup_sandbox_uploads_host_dir(name)
             if rm_rc == 0:
                 reaped += 1
@@ -1399,10 +1458,6 @@ async def cancel_chat_sandbox_execs(chat_id: str) -> int:
     return len(entries)
 
 
-# Backwards-compatible alias matching Spec §4.4 wording
-cancel_ActiveRun_sandbox_execs = cancel_chat_sandbox_execs
-
-
 async def execute_sandbox_exec(
     run_ctx: ResolvedSandboxRun,
     *,
@@ -1491,6 +1546,26 @@ async def execute_sandbox_exec(
                 out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=2.0)
             except Exception:
                 out_b, err_b = b"", b""
+        except asyncio.CancelledError:
+            try:
+                if proc.returncode is None:
+                    proc.kill()
+            except ProcessLookupError:
+                pass
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(
+                    _kill_exec_processes_in_container(container_name, exec_tag),
+                    timeout=2.5,
+                )
+            except BaseException:
+                pass
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except BaseException:
+                pass
+            raise
     finally:
         _unregister_tracked_exec(tracked)
         _CONTAINER_LAST_USED[container_name] = time.monotonic()
@@ -2370,11 +2445,19 @@ async def control_project_sandbox_service(
         if matched:
             view = matched
 
-    if clean_action in {"start", "restart", "stop", "delete", "ack"}:
-        _schedule_sandbox_processes_notify(project_name, resolved_dir, uid_str)
-
     log_lines = out_clean.splitlines()
     tail_body = "\n".join(log_lines[1:]) if (log_lines and log_lines[0].startswith("STATE=")) else out_clean
+    transition = None
+    if clean_action in {"start", "restart"} and view["alive"]:
+        tracked = _SANDBOX_WATCHED_SERVICES.setdefault(container_name, {})
+        tracked[safe_name] = (uid_str, resolved_dir, project_name, view["started_at"])
+    elif clean_action in {"start", "restart"} and view["status"] == "crashed":
+        _SANDBOX_WATCHED_SERVICES.get(container_name, {}).pop(safe_name, None)
+        transition = {"transition": "crashed", "service": view, "error_tail": tail_body}
+    elif clean_action in {"stop", "delete"} and not is_err:
+        _SANDBOX_WATCHED_SERVICES.get(container_name, {}).pop(safe_name, None)
+    if clean_action in {"start", "restart", "stop", "delete", "ack"}:
+        _schedule_sandbox_processes_notify(project_name, resolved_dir, uid_str, transition)
     return {
         "ok": not is_err,
         "action": clean_action,

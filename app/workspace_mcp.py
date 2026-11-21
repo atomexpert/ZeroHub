@@ -50,7 +50,7 @@ MCP_FILES_ALL_TOOLS: tuple[str, ...] = MCP_FILES_READ_TOOLS + MCP_FILES_WRITE_TO
 
 _MAX_READ_LINES = 800
 _MAX_READ_CHARS = 48_000
-_MAX_GREP_FILE_BYTES = 2 * 1024 * 1024
+_MAX_GREP_FILE_BYTES = 8 * 1024 * 1024
 _MAX_WRITE_CHARS = 4 * 1024 * 1024
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
@@ -990,10 +990,14 @@ def _sync_grep_search(
                 break
 
     hits: list[str] = []
+    skipped_large = 0
     for fp in candidate_files:
         try:
             st_sz = fp.stat().st_size
-            if st_sz == 0 or st_sz > _MAX_GREP_FILE_BYTES:
+            if st_sz == 0:
+                continue
+            if st_sz > _MAX_GREP_FILE_BYTES:
+                skipped_large += 1
                 continue
             with fp.open("rb") as fb:
                 sample = fb.read(2048)
@@ -1021,6 +1025,11 @@ def _sync_grep_search(
             break
 
     if not hits:
+        if skipped_large > 0:
+            return (
+                f"Совпадений по запросу `{clean_q}` не найдено "
+                f"(пропущено файлов > 8 МиБ: {skipped_large})."
+            )
         return f"Совпадений по запросу `{clean_q}` не найдено."
     return f"Найдено совпадений ({len(hits)}):\n" + "\n".join(hits)
 

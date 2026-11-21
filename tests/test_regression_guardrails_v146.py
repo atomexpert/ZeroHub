@@ -132,7 +132,7 @@ class TestStagedGuardPolicy(unittest.TestCase):
 
     def test_static_change_requires_cache_bump(self) -> None:
         for path in ("app/static/app.js", "app/static/styles.css", "app/static/ui-system.css",
-                     "app/static/vendor/marked.min.js", "app/static/sw.js"):
+                     "app/static/index.html", "app/static/vendor/marked.min.js", "app/static/sw.js"):
             with self.subTest(path=path):
                 errors = self.errors([path], staged_v=145, head_v=145)
                 self.assertEqual(len(errors), 1, errors)
@@ -146,7 +146,7 @@ class TestStagedGuardPolicy(unittest.TestCase):
                                      staged_v=146, head_v=145), [])
         self.assertEqual(self.errors(["app/main.py", "tools/verify_hub.py", "tests/test_x.py"],
                                      staged_v=145, head_v=145), [])
-        self.assertEqual(self.errors(["app/static/index.html", "app/static/icon.svg"],
+        self.assertEqual(self.errors(["app/static/icon.svg"],
                                      staged_v=145, head_v=145), [])
         self.assertEqual(self.errors(["app/static/app.js"], staged_v=1, head_v=None), [])
 

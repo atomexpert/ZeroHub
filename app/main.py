@@ -4,11 +4,14 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging
 import mimetypes
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.parse
 import uuid
@@ -54,6 +57,7 @@ from . import (
     openrouter_service,
     project_migrator,
     proxy_router,
+    push_service,
     release_service,
     sandbox_service,
     tts_service,
@@ -110,6 +114,26 @@ ACTIVE_TURN_TASKS: dict[str, asyncio.Task] = {}
 CHAT_TURN_QUEUES: dict[str, list[dict[str, Any]]] = {}
 CHAT_QUEUE_PAUSED: set[str] = set()
 _INFLIGHT_HQ_RETURN_UIDS: set[tuple[str, str]] = set()
+_CHAT_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
+_STREAM_CHECKPOINT_INTERVAL_SEC: float = 6.0
+_THINKING_UPDATE_MIN_INTERVAL_SEC: float = 0.25
+_WS_SEND_TIMEOUT_SEC: float = 4.0
+
+
+def _get_chat_dispatch_lock(chat_id: str) -> asyncio.Lock:
+    cid = str(chat_id or "").strip()
+    lock = _CHAT_DISPATCH_LOCKS.get(cid)
+    try:
+        cur_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        cur_loop = None
+    if lock is None or (
+        cur_loop is not None
+        and getattr(lock, "_loop", None) not in (None, cur_loop)
+    ):
+        lock = asyncio.Lock()
+        _CHAT_DISPATCH_LOCKS[cid] = lock
+    return lock
 
 
 def _try_acquire_compaction(
@@ -257,6 +281,7 @@ def merge_assistant_usage(
         "last_run_output_tokens",
         "last_run_thinking_tokens",
         "last_run_llm_calls",
+        "last_run_duration_ms",
         "proc_runs",
     )
 
@@ -291,6 +316,13 @@ def merge_assistant_usage(
         merged["last_run_thinking_tokens"] = int(incoming.get("thinking_tokens") or 0)
         if "last_run_llm_calls" in incoming:
             merged["last_run_llm_calls"] = max(1, int(incoming.get("last_run_llm_calls") or 1))
+
+    inc_last_dur = incoming.get("last_run_duration_ms")
+    inc_dur = incoming.get("duration_ms")
+    if isinstance(inc_last_dur, (int, float)) and not isinstance(inc_last_dur, bool) and inc_last_dur > 0:
+        merged["last_run_duration_ms"] = max(1, int(round(inc_last_dur)))
+    elif isinstance(inc_dur, (int, float)) and not isinstance(inc_dur, bool) and inc_dur > 0:
+        merged["last_run_duration_ms"] = max(1, int(round(inc_dur)))
 
     if "code_handoffs" in prev and isinstance(prev["code_handoffs"], list):
         merged["code_handoffs"] = list(prev["code_handoffs"])
@@ -773,8 +805,10 @@ async def _broadcast_chat_event(
 class ConnectionManager:
     """Broadcasts live events across connected devices with strict per-user RBAC scoping."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, send_timeout_sec: float = _WS_SEND_TIMEOUT_SEC) -> None:
         self.active: dict[WebSocket, dict[str, Any]] = {}
+        self.client_focus: dict[WebSocket, tuple[bool, str, float]] = {}
+        self.send_timeout_sec: float = float(send_timeout_sec)
 
     async def connect(self, ws: WebSocket, user: dict[str, Any]) -> None:
         await ws.accept()
@@ -782,31 +816,56 @@ class ConnectionManager:
 
     def disconnect(self, ws: WebSocket) -> None:
         self.active.pop(ws, None)
+        self.client_focus.pop(ws, None)
+
+    def update_client_focus(self, ws: WebSocket, data: dict[str, Any]) -> None:
+        self.client_focus[ws] = (
+            bool(data.get("visible")), str(data.get("active_chat_id") or "")[:120], time.monotonic()
+        )
+
+    def is_user_actively_viewing_chat(self, user_id: str, chat_id: str) -> bool:
+        now = time.monotonic()
+        return any(
+            visible and cid == chat_id and now - seen <= 90.0
+            and self.active.get(ws, {}).get("id") == user_id
+            for ws, (visible, cid, seen) in self.client_focus.items()
+        )
 
     async def disconnect_user(self, user_id: str) -> None:
         targets = [ws for ws, u in list(self.active.items()) if u.get("id") == user_id]
         for ws in targets:
-            self.active.pop(ws, None)
+            self.disconnect(ws)
             try:
                 await ws.close(code=4401)
             except Exception:
                 pass
+
+    async def _send_one(self, ws: WebSocket, payload: dict[str, Any]) -> None:
+        try:
+            await asyncio.wait_for(ws.send_json(payload), timeout=self.send_timeout_sec)
+        except Exception:
+            self.disconnect(ws)
+            close_fn = getattr(ws, "close", None)
+            if callable(close_fn):
+                try:
+                    res = close_fn()
+                    if asyncio.iscoroutine(res):
+                        await asyncio.wait_for(res, timeout=1.0)
+                except Exception:
+                    pass
 
     async def _send_to_matching(
         self,
         payload: dict[str, Any],
         predicate,
     ) -> None:
-        dead: list[WebSocket] = []
-        for ws, u in list(self.active.items()):
-            if not predicate(u):
-                continue
-            try:
-                await ws.send_json(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            self.active.pop(ws, None)
+        targets = [ws for ws, u in list(self.active.items()) if predicate(u)]
+        if not targets:
+            return
+        await asyncio.gather(
+            *(self._send_one(ws, payload) for ws in targets),
+            return_exceptions=True,
+        )
 
     async def broadcast_all(self, payload: dict[str, Any]) -> None:
         await self._send_to_matching(payload, lambda _u: True)
@@ -832,21 +891,23 @@ class ConnectionManager:
             masked_chat.pop("project_path", None)
             guest_payload = {**payload, "chat": masked_chat}
 
-        if chat.get("kind") == "project" and shared_member_ids is not None:
-            await self._send_to_matching(payload, lambda u: u.get("role") == "admin")
-            await self._send_to_matching(
-                guest_payload,
-                lambda u: u.get("role") != "admin" and u.get("id") in shared_member_ids,
-            )
-        else:
-            await self._send_to_matching(
-                payload,
-                lambda u: u.get("role") == "admin" and u.get("id") == owner_id,
-            )
-            await self._send_to_matching(
-                guest_payload,
-                lambda u: u.get("role") != "admin" and u.get("id") == owner_id,
-            )
+        deliveries: list[tuple[WebSocket, dict[str, Any]]] = []
+        is_shared_proj = chat.get("kind") == "project" and shared_member_ids is not None
+        for ws, u in list(self.active.items()):
+            is_adm = u.get("role") == "admin"
+            if is_shared_proj:
+                if is_adm:
+                    deliveries.append((ws, payload))
+                elif u.get("id") in shared_member_ids:
+                    deliveries.append((ws, guest_payload))
+            elif u.get("id") == owner_id:
+                deliveries.append((ws, payload if is_adm else guest_payload))
+        if not deliveries:
+            return
+        await asyncio.gather(
+            *(self._send_one(ws, p) for ws, p in deliveries),
+            return_exceptions=True,
+        )
 
     async def broadcast_models_per_user(
         self,
@@ -947,6 +1008,7 @@ openrouter_service.set_openrouter_active_turn_finder(find_active_turn_for_user)
 _USER_CHAT_READ_TS: dict[str, dict[str, float]] = {}
 _USER_READ_ALL_TS: dict[str, float] = {}
 _CHAT_LAST_TERMINAL_TS_MS: dict[str, float] = {}
+_CHAT_GEN_STARTED_TS_MS: dict[str, int] = {}
 _LAST_READ_SYNC_CLOCK_MS: float = 0.0
 _MAX_USER_READ_ENTRIES = 500
 _MAX_CHAT_TERMINAL_ENTRIES = 1000
@@ -1032,8 +1094,24 @@ def purge_deleted_chat_read_ts(chat_id: str) -> None:
     if not cid:
         return
     _CHAT_LAST_TERMINAL_TS_MS.pop(cid, None)
-    for bucket in _USER_CHAT_READ_TS.values():
+    _CHAT_GEN_STARTED_TS_MS.pop(cid, None)
+    _CHAT_DISPATCH_LOCKS.pop(cid, None)
+    empty_uids: list[str] = []
+    for uid, bucket in list(_USER_CHAT_READ_TS.items()):
         bucket.pop(cid, None)
+        if not bucket:
+            empty_uids.append(uid)
+    for uid in empty_uids:
+        if not _USER_CHAT_READ_TS.get(uid):
+            _USER_CHAT_READ_TS.pop(uid, None)
+
+
+def purge_deleted_user_read_ts(user_id: str) -> None:
+    uid = str(user_id or "").strip()
+    if not uid:
+        return
+    _USER_CHAT_READ_TS.pop(uid, None)
+    _USER_READ_ALL_TS.pop(uid, None)
 
 
 async def sync_and_broadcast_user_chat_read(
@@ -1487,6 +1565,143 @@ def _spawn_telemetry_task(coro: Any) -> asyncio.Task[Any]:
     return t
 
 
+def is_user_actively_viewing_chat(user_id: str, chat_id: str) -> bool:
+    return ws_manager.is_user_actively_viewing_chat(user_id, chat_id)
+
+
+def _notification_excerpt(text: str, project_dir: Optional[Path | str] = None) -> str:
+    text = re.sub(r"<TASK_PROFILE\b[^>]*>.*?(?:</TASK_PROFILE>|$)", "", text, flags=re.I | re.S)
+    text = re.sub(r"(?:^|\n)[ \t]*(?:\x60{3,}|~{3,}).*?(?:\n[ \t]*(?:\x60{3,}|~{3,})[^\n]*|$)", "", text, flags=re.S)
+    text = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"file://[^\s<>]+", "", text, flags=re.I)
+    text = host_service_manager.mask_sensitive_log_text(text, project_dir=project_dir)
+    for line in text.splitlines():
+        if line.lstrip().startswith("|") or line.count("|") >= 2:
+            continue
+        line = re.sub(r"^\s*(?:[#>*+-]+\s+)+", "", line).strip(" \t*_~\x60")
+        if line and not re.fullmatch(r"[-=]+", line):
+            return line[:120]
+    return ""
+
+
+async def _deliver_notification(user_ids: set[str], payload: dict[str, Any], duration_ms: int = 0) -> None:
+    kind = payload["data"]["kind"]
+    chat_id = payload["data"].get("chat_id")
+
+    async def deliver(uid: str) -> None:
+        try:
+            if chat_id and is_user_actively_viewing_chat(uid, chat_id):
+                return
+            user = await database.get_user_by_id(uid)
+            if not user or not user.get("is_active"):
+                return
+            prefs = database.normalize_notification_prefs(user.get("notification_prefs"))
+            if not (prefs["system_push"] and prefs[f"on_{kind}"]):
+                return
+            if kind == "turn_done" and prefs["only_long_turns"] and duration_ms < 15000:
+                return
+            _, failed = await push_service.notify_user(uid, payload)
+            if failed and ws_manager.active:
+                await _broadcast_notification_devices(uid)
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Web Push delivery failed (%s)", type(exc).__name__)
+
+    await asyncio.gather(*(deliver(uid) for uid in user_ids if uid))
+
+
+async def _dispatch_turn_webpush(
+    chat: dict[str, Any], kind: str, message: Optional[dict[str, Any]], error: str = "",
+) -> None:
+    chat_id = str(chat["id"])
+    proj_name = str(chat.get("project_name") or "") if chat.get("kind") == "project" else ""
+    # Resolve current membership because permissions can change during a generation.
+    shared = await database.get_shared_project_by_name(proj_name) if proj_name else None
+    recipients = {str(chat.get("owner_id") or "admin"), *(shared or {}).get("member_ids", [])}
+    usage = (message or {}).get("usage") or {}
+    duration_ms = int(usage.get("last_run_duration_ms") or 0)
+    chat_title = _notification_excerpt(str(chat.get("title") or "")) or "Диалог"
+    project_title = _notification_excerpt(proj_name)
+    title = " · ".join(part for part in (project_title, chat_title) if part)
+    if kind == "turn_done":
+        body = _notification_excerpt(str((message or {}).get("content") or ""), chat.get("project_path")) or "Задача завершена"
+        if duration_ms:
+            body += f" · {max(1, round(duration_ms / 1000))} с"
+    else:
+        body = _notification_excerpt(error, chat.get("project_path")) or "Ошибка генерации"
+    await _deliver_notification(recipients, {
+        "title": f"{'✅' if kind == 'turn_done' else '⚠️'} {title}",
+        "body": body,
+        "tag": f"zerohub-chat-{chat_id}",
+        "data": {"kind": kind, "chat_id": chat_id, "project_name": proj_name, "url": f"/?open_chat={urllib.parse.quote(chat_id, safe='')}"},
+    }, duration_ms)
+
+
+_PROCESS_PUSH_RECENT: dict[tuple[Any, ...], float] = {}
+
+
+async def _dispatch_process_crash_webpush(
+    project_name: str, project_dir: Optional[Path | str], event: dict[str, Any], docker_user_id: Optional[str],
+) -> None:
+    service = event.get("service") or {}
+    svc_name = str(service.get("name") or "")
+    exit_code = service.get("exit_code")
+    if not svc_name or exit_code == 0:
+        return
+    scope = str(docker_user_id or project_dir or "")
+    key = (
+        project_name.lower(), svc_name.lower(), service.get("pid"), exit_code,
+        os.path.normcase(scope), service.get("started_at"),
+    )
+    now = time.monotonic()
+    for stale in [k for k, seen in _PROCESS_PUSH_RECENT.items() if now - seen >= 60]:
+        _PROCESS_PUSH_RECENT.pop(stale)
+    if key in _PROCESS_PUSH_RECENT:
+        return
+    _PROCESS_PUSH_RECENT[key] = now
+
+    if docker_user_id:
+        recipients = {docker_user_id}
+    else:
+        shared = await database.get_shared_project_by_name(project_name)
+        members = set((shared or {}).get("member_ids") or [])
+        recipients = set()
+        for user in await database.list_users():
+            uid = str(user["id"])
+            is_admin = user["role"] == "admin"
+            if not user.get("is_active") or not (is_admin or uid in members):
+                continue
+            if not host_service_manager.is_user_host_eligible(user):
+                continue
+            resolved = await asyncio.to_thread(
+                brain_reader.resolve_user_project,
+                project_name,
+                user,
+                [shared] if shared else [],
+            )
+            if not resolved or brain_reader.resolve_effective_project_execution_mode(user, resolved) != "host":
+                continue
+            if project_dir and Path(resolved["path"]).resolve() != Path(project_dir).resolve():
+                continue
+            recipients.add(uid)
+    error = host_service_manager.mask_sensitive_log_text(
+        str(event.get("error_tail") or ""), project_dir=project_dir, max_lines=1,
+    )
+    body = "Фоновый процесс завершился со сбоем"
+    if exit_code is not None:
+        body += f" (exit {exit_code})"
+    if error:
+        body += " · " + (_notification_excerpt(error) or "")[:120]
+    await _deliver_notification(recipients, {
+        "title": f"💥 {_notification_excerpt(project_name)} · {_notification_excerpt(svc_name)}",
+        "body": body,
+        "tag": f"zerohub-proc-{project_name}-{svc_name}",
+        "data": {
+            "kind": "process_crash", "project_name": project_name, "service_name": svc_name,
+            "url": f"/?open_processes={urllib.parse.quote(project_name, safe='')}",
+        },
+    })
+
+
 async def _refresh_and_broadcast_quotas(
     trigger_user_id: Optional[str] = None,
     *,
@@ -1772,11 +1987,11 @@ async def lifespan(_app: FastAPI):
     sandbox_service.start_sandbox_reaper()
     host_service_manager.start_host_services_watchdog()
     from .storage_maintenance import cleanup_stale_large_prompt_files
-    asyncio.create_task(asyncio.to_thread(cleanup_stale_large_prompt_files))
-    asyncio.create_task(fetch_available_models())
-    asyncio.create_task(fetch_account_quotas())
-    asyncio.create_task(check_docker_status())
-    asyncio.create_task(voice.preload_default_model())
+    _spawn_telemetry_task(asyncio.to_thread(cleanup_stale_large_prompt_files))
+    _spawn_telemetry_task(fetch_available_models())
+    _spawn_telemetry_task(fetch_account_quotas())
+    _spawn_telemetry_task(check_docker_status())
+    _spawn_telemetry_task(voice.preload_default_model())
     tunnel.start_tunnel_supervisor()
     watch_task = asyncio.create_task(_watch_account_sync_loop())
     gdrive_sync_task: Optional[asyncio.Task] = None
@@ -1804,6 +2019,40 @@ async def lifespan(_app: FastAPI):
             await watch_task
         except asyncio.CancelledError:
             pass
+        for live_cid in list(active_generations.keys()):
+            try:
+                snap = get_active_run_snapshot(live_cid)
+                if snap and (snap.get("content") or snap.get("thinking") or snap.get("tool_calls")):
+                    await database.checkpoint_chat_streaming_message(
+                        live_cid,
+                        content=str(snap.get("content") or ""),
+                        thinking=str(snap.get("thinking") or ""),
+                        tool_calls=normalize_interrupted_tool_calls(snap.get("tool_calls")),
+                    )
+            except Exception:
+                pass
+            try:
+                await cancel_chat_generation(live_cid)
+            except Exception:
+                pass
+        cur_shutdown_task = asyncio.current_task()
+        shutdown_tasks: set[asyncio.Task[Any]] = set()
+        for bucket in (
+            ACTIVE_TURN_TASKS.values(),
+            COMPACTING_TASKS.values(),
+            _TELEMETRY_BG_TASKS,
+            _LIVE_OUTLINE_TITLE_TASKS,
+        ):
+            for t in list(bucket):
+                if t is not None and t is not cur_shutdown_task and not t.done():
+                    shutdown_tasks.add(t)
+        for t in shutdown_tasks:
+            t.cancel()
+        if shutdown_tasks:
+            try:
+                await asyncio.wait(shutdown_tasks, timeout=3.0)
+            except Exception:
+                pass
         await host_service_manager.stop_host_services_watchdog()
         await sandbox_service.stop_sandbox_reaper()
         await tunnel.stop_tunnel_supervisor()
@@ -1811,12 +2060,32 @@ async def lifespan(_app: FastAPI):
         await database.close_db_pool()
 
 
+class _SelectiveGZipMiddleware:
+    """Bypass GZip compression for binary media/upload routes while compressing other HTTP traffic."""
+
+    _BYPASS_PREFIXES = ("/api/media", "/api/uploads")
+
+    def __init__(self, app: Any, minimum_size: int = 1000) -> None:
+        self.app = app
+        self._gzip = GZipMiddleware(app, minimum_size=minimum_size)
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") == "http":
+            path = str(scope.get("path") or "")
+            if path.startswith(self._BYPASS_PREFIXES):
+                await self.app(scope, receive, send)
+                return
+            await self._gzip(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(
     title="Antigravity Hub",
     version=config.get_app_version(),
     lifespan=lifespan,
 )
-app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(_SelectiveGZipMiddleware, minimum_size=1000)
 
 
 class _ProjectsListCacheInvalidationMiddleware:
@@ -2158,6 +2427,7 @@ class UpdateProjectEnvRequest(BaseModel):
     entries: list[ProjectEnvEntryPayload] = Field(default_factory=list)
     raw_content: Optional[str] = None
     ensure_gitignore: bool = True
+    expected_sha256: Optional[str] = None
 
 
 class SyncProjectEnvExampleRequest(BaseModel):
@@ -2321,7 +2591,7 @@ def _update_env_pin(new_pin: str) -> None:
             out.append(line)
     if not replaced:
         out.append(f"HUB_PIN={new_pin}")
-    env_file.write_text("\n".join(out) + "\n", encoding="utf-8")
+    config.atomic_write_text(env_file, "\n".join(out) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -2342,6 +2612,7 @@ async def auth_me(current_user: dict[str, Any] = Depends(auth.get_current_user))
         "ok": True,
         "user": current_user,
         "advisor_prefs": database.normalize_advisor_prefs(current_user.get("advisor_prefs")),
+        "notification_prefs": database.normalize_notification_prefs(current_user.get("notification_prefs")),
     }
 
 
@@ -2402,7 +2673,9 @@ async def auth_change_pin(
         raise HTTPException(status_code=404, detail="Пользователь не найден")
 
     if current_user["id"] == "admin":
-        _update_env_pin(clean_new)
+        await asyncio.to_thread(_update_env_pin, clean_new)
+
+    await ws_manager.disconnect_user(updated_user["id"])
 
     await openrouter_service.sync_user_openrouter_cli_files(updated_user["id"])
     await sandbox_service.sync_user_sandbox_cli_files_by_id(updated_user["id"])
@@ -2425,6 +2698,100 @@ async def auth_change_pin(
 # ---------------------------------------------------------------------------
 # System, Models, Quotas & QR Code
 # ---------------------------------------------------------------------------
+
+
+@app.get("/api/notifications/state")
+async def api_notification_state(user: dict[str, Any] = Depends(auth.get_current_user)):
+    return {
+        "ok": True,
+        "prefs": database.normalize_notification_prefs(user.get("notification_prefs")),
+        "vapid_public_key": await push_service.vapid_public_key(),
+        "subscriptions": await database.list_user_push_subscriptions(user["id"]),
+    }
+
+
+@app.put("/api/notifications/prefs")
+async def api_notification_prefs(
+    patch: dict[str, Any] = Body(...), user: dict[str, Any] = Depends(auth.get_current_user)
+):
+    try:
+        saved = await database.update_user_notification_prefs(user["id"], patch)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail="Пользователь не найден") from exc
+    await ws_manager.broadcast_user(user["id"], {
+        "type": "notification_prefs_updated", "notification_prefs": saved,
+    })
+    return {"ok": True, "notification_prefs": saved}
+
+
+class PushSubscriptionKeys(BaseModel):
+    p256dh: str = Field(max_length=87)
+    auth: str = Field(max_length=22)
+
+
+class PushSubscribeRequest(BaseModel):
+    endpoint: str = Field(min_length=1, max_length=2048)
+    keys: PushSubscriptionKeys
+    device_label: str = Field(default="", max_length=100)
+
+
+class PushUnsubscribeRequest(BaseModel):
+    endpoint: str = Field(default="", max_length=2048)
+    sub_id: str = Field(default="", max_length=100)
+
+
+@app.post("/api/notifications/push/subscribe")
+async def api_push_subscribe(
+    subscription: PushSubscribeRequest, request: Request,
+    user: dict[str, Any] = Depends(auth.get_current_user),
+):
+    try:
+        push_service.validate_push_keys(subscription.keys.p256dh, subscription.keys.auth)
+        await asyncio.to_thread(push_service.validate_push_endpoint, subscription.endpoint)
+    except (ValueError, OSError) as exc:
+        raise HTTPException(status_code=400, detail="Некорректная подписка или публичный адрес Push") from exc
+    try:
+        sub_id = await database.upsert_push_subscription(
+            user["id"], subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth,
+            subscription.device_label.strip(), request.headers.get("user-agent", "")[:300],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    subscriptions = await _broadcast_notification_devices(user["id"])
+    return {"ok": True, "current_sub_id": sub_id, "subscriptions": subscriptions}
+
+
+async def _broadcast_notification_devices(user_id: str) -> list[dict[str, Any]]:
+    subscriptions = await database.list_user_push_subscriptions(user_id)
+    await ws_manager.broadcast_user(user_id, {
+        "type": "notification_devices_updated", "subscriptions": subscriptions,
+    })
+    return subscriptions
+
+
+@app.post("/api/notifications/push/unsubscribe")
+async def api_push_unsubscribe(
+    subscription: PushUnsubscribeRequest, user: dict[str, Any] = Depends(auth.get_current_user)
+):
+    if not (subscription.sub_id or subscription.endpoint):
+        raise HTTPException(status_code=400, detail="Укажите подписку Push")
+    await database.delete_push_subscription(user["id"], sub_id=subscription.sub_id, endpoint=subscription.endpoint)
+    return {"ok": True, "subscriptions": await _broadcast_notification_devices(user["id"])}
+
+
+@app.post("/api/notifications/push/test")
+async def api_push_test(user: dict[str, Any] = Depends(auth.get_current_user)):
+    sent, failed = await push_service.notify_user(user["id"], {
+        "title": "🔔 ZeroHub — Проверка связи",
+        "body": "Push-уведомления подключены и работают.",
+        "tag": "zerohub-test",
+        "data": {"kind": "test", "url": "/"},
+    })
+    if not (sent or failed):
+        raise HTTPException(status_code=400, detail="Сначала подключите устройство для Push")
+    if failed:
+        await _broadcast_notification_devices(user["id"])
+    return {"ok": True, "sent_count": sent, "failed_count": failed}
 
 
 @app.get("/api/system/info")
@@ -4226,6 +4593,7 @@ async def api_admin_delete_user(
         raise HTTPException(status_code=400, detail=str(exc))
     if not ok:
         raise HTTPException(status_code=404, detail="Пользователь не найден")
+    purge_deleted_user_read_ts(user_id)
     return {"ok": True}
 
 
@@ -4439,11 +4807,21 @@ async def api_voice_transcribe(
     project_name: str = Form(""),
     _u: dict[str, Any] = Depends(auth.get_current_user),
 ):
-    raw = await audio.read()
+    max_audio_bytes = 25 * 1024 * 1024
+    chunk_size = 1024 * 1024
+    audio_chunks: list[bytes] = []
+    total_audio_size = 0
+    while True:
+        chunk = await audio.read(chunk_size)
+        if not chunk:
+            break
+        total_audio_size += len(chunk)
+        if total_audio_size > max_audio_bytes:
+            raise HTTPException(status_code=413, detail="Аудиофайл превышает 25 МБ")
+        audio_chunks.append(chunk)
+    raw = b"".join(audio_chunks)
     if not raw:
         raise HTTPException(status_code=400, detail="Пустой аудиофайл")
-    if len(raw) > 25 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Аудиофайл превышает 25 МБ")
     try:
         is_live = live_preview.strip().lower() in ("1", "true", "yes", "on")
         res = await voice.transcribe_audio(
@@ -4453,6 +4831,7 @@ async def api_voice_transcribe(
             model_name=model,
             live_preview=is_live,
             offset_sec=max(0.0, float(offset_sec or 0.0)),
+            session_key=str(_u.get("id") or "_global"),
         )
         use_smart = smart_format.strip().lower() in ("1", "true", "yes", "on")
         if use_smart and res.get("text"):
@@ -4838,8 +5217,11 @@ async def api_create_chat(
         shared_projs = await database.list_shared_projects(
             for_user_id=current_user["id"], is_admin=is_admin
         )
-        resolved = brain_reader.resolve_user_project(
-            body.project_name, current_user, shared_projs
+        resolved = await asyncio.to_thread(
+            brain_reader.resolve_user_project,
+            body.project_name,
+            current_user,
+            shared_projs,
         )
         if not resolved:
             raise HTTPException(
@@ -4963,18 +5345,22 @@ async def api_get_chat(
         chat["last_terminal_ts_ms"] = int(_CHAT_LAST_TERMINAL_TS_MS[chat_id])
     messages = await database.get_messages(chat_id, include_thinking=include_thinking)
     snap = get_active_run_snapshot(chat_id)
-    if snap and messages:
+    active_gen_started_ms = _CHAT_GEN_STARTED_TS_MS.get(chat_id)
+    if (snap or active_gen_started_ms is not None) and messages:
         for m in reversed(messages):
             if m.get("role") == "assistant" and m.get("status") == "streaming":
-                if snap["content"]:
-                    m["content"] = snap["content"]
-                if snap["thinking"]:
-                    m["thinking"] = snap["thinking"]
-                    m["has_thinking"] = True
-                if snap["tool_calls"]:
-                    m["tool_calls"] = database.compact_tool_calls_payload(snap["tool_calls"])
-                m["thinking_active"] = snap["thinking_active"]
-                m["stream_seq"] = snap["stream_seq"]
+                if snap:
+                    if snap["content"]:
+                        m["content"] = snap["content"]
+                    if snap["thinking"]:
+                        m["thinking"] = snap["thinking"]
+                        m["has_thinking"] = True
+                    if snap["tool_calls"]:
+                        m["tool_calls"] = database.compact_tool_calls_payload(snap["tool_calls"])
+                    m["thinking_active"] = snap["thinking_active"]
+                    m["stream_seq"] = snap["stream_seq"]
+                if active_gen_started_ms is not None:
+                    m["gen_started_at_ms"] = int(active_gen_started_ms)
                 break
     context_stats = compute_chat_context_stats(chat, messages)
     chat["context_stats"] = context_stats
@@ -5235,8 +5621,11 @@ async def api_update_chat(
             shared_projs = await database.list_shared_projects(
                 for_user_id=current_user["id"], is_admin=is_admin
             )
-            resolved = brain_reader.resolve_user_project(
-                proj_candidate, current_user, shared_projs
+            resolved = await asyncio.to_thread(
+                brain_reader.resolve_user_project,
+                proj_candidate,
+                current_user,
+                shared_projs,
             )
             if not resolved:
                 raise HTTPException(
@@ -5486,8 +5875,12 @@ async def _execute_chat_compaction(
     current_user: dict[str, Any],
     *,
     from_queue: bool = False,
+    _preacquired_token: Optional[str] = None,
 ) -> dict[str, Any]:
-    comp_token = _try_acquire_compaction(chat_id, allow_current_turn_task=from_queue)
+    comp_token = _preacquired_token
+    if not comp_token:
+        async with _get_chat_dispatch_lock(chat_id):
+            comp_token = _try_acquire_compaction(chat_id, allow_current_turn_task=from_queue)
     if not comp_token:
         raise HTTPException(
             status_code=409,
@@ -5693,64 +6086,73 @@ async def _execute_chat_compaction(
             released
             and live_chat_after is not None
             and not from_queue
-            and not is_chat_generating(chat_id)
-            and chat_id not in CHAT_QUEUE_PAUSED
-            and CHAT_TURN_QUEUES.get(chat_id)
         ):
-            q = CHAT_TURN_QUEUES.get(chat_id) or []
-            chosen_item: Optional[dict[str, Any]] = None
-            chosen_user: Optional[dict[str, Any]] = None
-            while q:
-                cand_item = q.pop(0)
-                cand_uid = str(cand_item.get("user_id") or "").strip()
-                cand_u = await database.get_user_by_id(cand_uid) if cand_uid else None
-                if cand_u and cand_u.get("is_active", False):
-                    allowed_q, _ = await _get_chat_access_context(live_chat_after, cand_u)
-                    if allowed_q:
-                        chosen_item = cand_item
-                        chosen_user = cand_u
-                        break
-            if not q:
-                CHAT_TURN_QUEUES.pop(chat_id, None)
-            await _broadcast_chat_queue(chat_id, live_chat_after)
-            if chosen_item is not None and chosen_user is not None:
-                if chosen_item.get("kind") != "compact":
-                    register_chat_turn(chat_id, user_id=chosen_user["id"])
-                task = asyncio.create_task(
-                    _run_turn_task(
-                        chat_id=chat_id,
-                        prompt=str(
-                            chosen_item.get("prompt")
-                            or "Проанализируй прикреплённые файлы."
-                        ),
-                        attachments=list(chosen_item.get("attachments") or []),
-                        override_model=chosen_item.get("model"),
-                        override_access_mode=chosen_item.get("access_mode"),
-                        trigger_user=chosen_user,
-                        initial_kind=str(chosen_item.get("kind") or "message"),
-                        referenced_chat_ids=list(
-                            chosen_item.get("referenced_chat_ids") or []
-                        ),
-                        referenced_chats=list(
-                            chosen_item.get("referenced_chats") or []
-                        ),
-                        live_voice=bool(chosen_item.get("live_voice", False)),
-                        live_session_id=str(chosen_item.get("live_session_id") or ""),
-                        tts_voice=str(chosen_item.get("tts_voice") or ""),
-                        tts_rate=str(chosen_item.get("tts_rate") or ""),
-                        handoff_meta=_sanitize_handoff_meta(
-                            chosen_item.get("handoff_meta")
-                        ),
-                        hq_return_source=_sanitize_hq_return_source(
-                            chosen_item.get("hq_return_source")
-                        ),
-                        hq_return_sources=_sanitize_hq_return_sources(chosen_item),
-                        preferred_accounts=_sanitize_turn_preferred_accounts(
-                            chosen_item
-                        ),
-                    )
-                )
-                ACTIVE_TURN_TASKS[chat_id] = task
+            broadcast_after_dequeue = False
+            async with _get_chat_dispatch_lock(chat_id):
+                active_t = ACTIVE_TURN_TASKS.get(chat_id)
+                if (
+                    not is_chat_generating(chat_id)
+                    and chat_id not in COMPACTING_CHATS
+                    and (active_t is None or active_t.done())
+                    and chat_id not in CHAT_QUEUE_PAUSED
+                    and CHAT_TURN_QUEUES.get(chat_id)
+                ):
+                    q = CHAT_TURN_QUEUES.get(chat_id) or []
+                    chosen_item: Optional[dict[str, Any]] = None
+                    chosen_user: Optional[dict[str, Any]] = None
+                    while q:
+                        cand_item = q.pop(0)
+                        broadcast_after_dequeue = True
+                        cand_uid = str(cand_item.get("user_id") or "").strip()
+                        cand_u = await database.get_user_by_id(cand_uid) if cand_uid else None
+                        if cand_u and cand_u.get("is_active", False):
+                            allowed_q, _ = await _get_chat_access_context(live_chat_after, cand_u)
+                            if allowed_q:
+                                chosen_item = cand_item
+                                chosen_user = cand_u
+                                break
+                    if not q:
+                        CHAT_TURN_QUEUES.pop(chat_id, None)
+                    if chosen_item is not None and chosen_user is not None:
+                        if chosen_item.get("kind") != "compact":
+                            register_chat_turn(chat_id, user_id=chosen_user["id"])
+                        task = asyncio.create_task(
+                            _run_turn_task(
+                                chat_id=chat_id,
+                                prompt=str(
+                                    chosen_item.get("prompt")
+                                    or "Проанализируй прикреплённые файлы."
+                                ),
+                                attachments=list(chosen_item.get("attachments") or []),
+                                override_model=chosen_item.get("model"),
+                                override_access_mode=chosen_item.get("access_mode"),
+                                trigger_user=chosen_user,
+                                initial_kind=str(chosen_item.get("kind") or "message"),
+                                referenced_chat_ids=list(
+                                    chosen_item.get("referenced_chat_ids") or []
+                                ),
+                                referenced_chats=list(
+                                    chosen_item.get("referenced_chats") or []
+                                ),
+                                live_voice=bool(chosen_item.get("live_voice", False)),
+                                live_session_id=str(chosen_item.get("live_session_id") or ""),
+                                tts_voice=str(chosen_item.get("tts_voice") or ""),
+                                tts_rate=str(chosen_item.get("tts_rate") or ""),
+                                handoff_meta=_sanitize_handoff_meta(
+                                    chosen_item.get("handoff_meta")
+                                ),
+                                hq_return_source=_sanitize_hq_return_source(
+                                    chosen_item.get("hq_return_source")
+                                ),
+                                hq_return_sources=_sanitize_hq_return_sources(chosen_item),
+                                preferred_accounts=_sanitize_turn_preferred_accounts(
+                                    chosen_item
+                                ),
+                            )
+                        )
+                        ACTIVE_TURN_TASKS[chat_id] = task
+            if broadcast_after_dequeue:
+                await _broadcast_chat_queue(chat_id, live_chat_after)
 
 
 @app.post("/api/chats/{chat_id}/compact")
@@ -5765,39 +6167,59 @@ async def api_compact_chat(
     if not allowed:
         raise HTTPException(status_code=403, detail="Нет доступа к этому диалогу")
 
-    if chat_id in COMPACTING_CHATS:
-        raise HTTPException(
-            status_code=409,
-            detail="Сжатие контекста уже выполняется",
-        )
+    queued_item: Optional[dict[str, Any]] = None
+    preacquired_token: Optional[str] = None
+    async with _get_chat_dispatch_lock(chat_id):
+        if chat_id in COMPACTING_CHATS:
+            raise HTTPException(
+                status_code=409,
+                detail="Сжатие контекста уже выполняется",
+            )
 
-    active_t = ACTIVE_TURN_TASKS.get(chat_id)
-    if is_chat_generating(chat_id) or (active_t is not None and not active_t.done()):
-        q = CHAT_TURN_QUEUES.setdefault(chat_id, [])
-        existing = next((it for it in q if it.get("kind") == "compact"), None)
-        if not existing:
-            existing = {
-                "id": uuid.uuid4().hex[:10],
-                "chat_id": chat_id,
-                "kind": "compact",
-                "prompt": "Сжатие контекста без потери смысла",
-                "attachments": [],
-                "model": chat.get("model"),
-                "access_mode": chat.get("access_mode"),
-                "user_id": current_user["id"],
-                "author_name": (
-                    current_user.get("display_name")
-                    or current_user.get("username")
-                    or ""
-                ),
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-            q.append(existing)
-        CHAT_QUEUE_PAUSED.discard(chat_id)
+        active_t = ACTIVE_TURN_TASKS.get(chat_id)
+        if is_chat_generating(chat_id) or (active_t is not None and not active_t.done()):
+            q = CHAT_TURN_QUEUES.setdefault(chat_id, [])
+            existing = next((it for it in q if it.get("kind") == "compact"), None)
+            if not existing:
+                existing = {
+                    "id": uuid.uuid4().hex[:10],
+                    "chat_id": chat_id,
+                    "kind": "compact",
+                    "prompt": "Сжатие контекста без потери смысла",
+                    "attachments": [],
+                    "model": chat.get("model"),
+                    "access_mode": chat.get("access_mode"),
+                    "user_id": current_user["id"],
+                    "author_name": (
+                        current_user.get("display_name")
+                        or current_user.get("username")
+                        or ""
+                    ),
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                }
+                q.append(existing)
+            CHAT_QUEUE_PAUSED.discard(chat_id)
+            queued_item = existing
+        else:
+            preacquired_token = _try_acquire_compaction(
+                chat_id, allow_current_turn_task=False
+            )
+            if not preacquired_token:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Сжатие или генерация в этом диалоге уже выполняется",
+                )
+
+    if queued_item is not None:
         await _broadcast_chat_queue(chat_id, chat)
-        return {"ok": True, "queued": True, "queue_item": existing}
+        return {"ok": True, "queued": True, "queue_item": queued_item}
 
-    return await _execute_chat_compaction(chat_id, current_user, from_queue=False)
+    return await _execute_chat_compaction(
+        chat_id,
+        current_user,
+        from_queue=False,
+        _preacquired_token=preacquired_token,
+    )
 
 
 @app.post("/api/chats/{chat_id}/upload")
@@ -5833,13 +6255,53 @@ async def api_upload_attachment(
         owner_username=owner_uname,
         is_shared_project=bool(shared_proj is not None),
     )
-    dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / unique_name
 
-    data = await file.read()
-    if len(data) > 35 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="Файл превышает лимит 35 МБ")
-    dest_path.write_bytes(data)
+    max_upload_bytes = 35 * 1024 * 1024
+    chunk_size = 1024 * 1024
+    total_size = 0
+
+    def _open_upload_tmp() -> tuple[Any, Path]:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        fh = tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=dest_dir,
+            prefix=f".{unique_name}.",
+            suffix=".tmp",
+            delete=False,
+        )
+        return fh, Path(fh.name)
+
+    def _finalize_upload_tmp(fh: Any, tmp_p: Path, dst_p: Path) -> None:
+        fh.flush()
+        os.fsync(fh.fileno())
+        fh.close()
+        os.replace(tmp_p, dst_p)
+
+    def _abort_upload_tmp(fh: Any, tmp_p: Path) -> None:
+        try:
+            fh.close()
+        except Exception:
+            pass
+        try:
+            tmp_p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    tmp_fh, tmp_path = await asyncio.to_thread(_open_upload_tmp)
+    try:
+        while True:
+            chunk = await file.read(chunk_size)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > max_upload_bytes:
+                raise HTTPException(status_code=413, detail="Файл превышает лимит 35 МБ")
+            await asyncio.to_thread(tmp_fh.write, chunk)
+        await asyncio.to_thread(_finalize_upload_tmp, tmp_fh, tmp_path, dest_path)
+    except BaseException:
+        await asyncio.to_thread(_abort_upload_tmp, tmp_fh, tmp_path)
+        raise
 
     mime = file.content_type or mimetypes.guess_type(safe_name)[0] or "application/octet-stream"
     return {
@@ -5847,7 +6309,7 @@ async def api_upload_attachment(
             "name": safe_name,
             "stored_name": unique_name,
             "mime_type": mime,
-            "size": len(data),
+            "size": total_size,
             "url": f"/api/uploads/{chat_id}/{unique_name}",
             "disk_path": str(dest_path),
         }
@@ -5874,6 +6336,35 @@ _EXT_MIME_OVERRIDES: dict[str, str] = {
     ".m4a": "audio/mp4",
     ".flac": "audio/flac",
     ".pdf": "application/pdf",
+    ".apk": "application/vnd.android.package-archive",
+    ".aab": "application/x-authorware-bin",
+    ".ipa": "application/octet-stream",
+    ".exe": "application/vnd.microsoft.portable-executable",
+    ".msi": "application/x-msi",
+    ".dmg": "application/x-apple-diskimage",
+    ".deb": "application/vnd.debian.binary-package",
+    ".rpm": "application/x-rpm",
+    ".zip": "application/zip",
+    ".whl": "application/zip",
+    ".7z": "application/x-7z-compressed",
+    ".rar": "application/vnd.rar",
+    ".gz": "application/gzip",
+    ".tgz": "application/gzip",
+    ".tar": "application/x-tar",
+    ".xz": "application/x-xz",
+    ".zst": "application/zstd",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".epub": "application/epub+zip",
+    ".csv": "text/csv; charset=utf-8",
+    ".tsv": "text/tab-separated-values; charset=utf-8",
+}
+
+_FORCE_DOWNLOAD_EXTS = {
+    ".apk", ".aab", ".ipa", ".exe", ".msi", ".msix", ".dmg", ".pkg", ".deb", ".rpm", ".appimage",
+    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".bz2", ".xz", ".zst", ".iso", ".whl",
+    ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".ods", ".epub", ".parquet",
 }
 
 
@@ -5935,20 +6426,40 @@ async def api_serve_upload(
     )
     if target is None or not target.exists() or not target.is_file():
         raise HTTPException(status_code=404, detail="Файл не найден")
-    if download:
+    suffix_low = target.suffix.lower()
+    mime = (
+        _EXT_MIME_OVERRIDES.get(suffix_low)
+        or mimetypes.guess_type(target.name)[0]
+        or "application/octet-stream"
+    )
+    force_download = bool(download) or suffix_low in (
+        {".html", ".htm", ".xhtml", ".xml", ".mhtml", ".shtml"} | _FORCE_DOWNLOAD_EXTS
+    )
+    if force_download:
         return FileResponse(
             target,
             filename=target.name,
+            media_type=mime,
             content_disposition_type="attachment",
+            headers={
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": "default-src 'none'; sandbox",
+            },
         )
     # Upload filenames are unique (uuid[:8]_name) and never rewritten in place,
     # so the browser may cache inline previews forever (instant tab re-open).
+    inline_headers = {
+        "Cache-Control": "private, max-age=31536000, immutable",
+        "X-Content-Type-Options": "nosniff",
+    }
+    if suffix_low == ".svg":
+        inline_headers["Content-Security-Policy"] = (
+            "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox"
+        )
     return FileResponse(
         target,
-        headers={
-            "Cache-Control": "private, max-age=31536000, immutable",
-            "X-Content-Type-Options": "nosniff",
-        },
+        media_type=mime,
+        headers=inline_headers,
     )
 
 
@@ -5995,8 +6506,11 @@ async def api_serve_generated_media(
                 shared_projs = await database.list_shared_projects(
                     for_user_id=current_user["id"], is_admin=is_admin
                 )
-                proj_info = brain_reader.resolve_user_project(
-                    chat_obj["project_name"], current_user, shared_projs
+                proj_info = await asyncio.to_thread(
+                    brain_reader.resolve_user_project,
+                    chat_obj["project_name"],
+                    current_user,
+                    shared_projs,
                 )
                 if proj_info and proj_info.get("path"):
                     resolved_chat_proj_dir = Path(proj_info["path"]).resolve()
@@ -6022,17 +6536,53 @@ async def api_serve_generated_media(
         except OSError:
             raise HTTPException(status_code=400, detail="Некорректный путь к файлу")
 
+    # Build allowed CLI `brain` roots BEFORE sensitive denylist so multi-account / per-user
+    # CLI brain artifacts inside `CLI_HOMES_DIR` are not prematurely rejected while all other
+    # paths inside `CLI_HOMES_DIR` remain strictly blocked.
+    cli_brain_roots: list[Path] = []
+    try:
+        cli_brain_roots.append((config.AGY_CLI_DATA_DIR / "brain").resolve())
+    except OSError:
+        pass
+    try:
+        cli_homes_res = config.CLI_HOMES_DIR.resolve()
+        agy_accs_dir = config.CLI_HOMES_DIR / "_agy_accounts"
+        if agy_accs_dir.is_dir():
+            for acc_b in agy_accs_dir.glob("*/antigravity-cli/brain"):
+                try:
+                    res_b = acc_b.resolve()
+                    if _is_within_dir(res_b, cli_homes_res):
+                        cli_brain_roots.append(res_b)
+                except OSError:
+                    pass
+        if config.CLI_HOMES_DIR.is_dir():
+            for pat in (
+                "*/.gemini/antigravity-cli/brain",
+                "*/.agy_homes/*/.gemini/antigravity-cli/brain",
+            ):
+                for user_b in config.CLI_HOMES_DIR.glob(pat):
+                    try:
+                        res_b = user_b.resolve()
+                        if _is_within_dir(res_b, cli_homes_res):
+                            cli_brain_roots.append(res_b)
+                    except OSError:
+                        pass
+    except OSError:
+        pass
+    matched_cli_brain = next((br for br in cli_brain_roots if _is_within_dir(target, br)), None)
+
     # 1. Hard Sensitive Denylist (always enforced, even for Admin)
-    forbidden_dirs = (
+    forbidden_dirs_list = [
         (config.DATA_DIR / "ssh").resolve(),
         config.CERTS_DIR.resolve(),
         config.SESSIONS_DIR.resolve(),
-        config.CLI_HOMES_DIR.resolve(),
         (config.DATA_DIR / "host_services").resolve(),
         (config.DATA_DIR / "tools").resolve(),
         (config.DATA_DIR / "models").resolve(),
-    )
-    if any(_is_within_dir(target, fd) for fd in forbidden_dirs):
+    ]
+    if matched_cli_brain is None:
+        forbidden_dirs_list.append(config.CLI_HOMES_DIR.resolve())
+    if any(_is_within_dir(target, fd) for fd in forbidden_dirs_list):
         raise HTTPException(status_code=403, detail="Доступ к системным каталогам запрещён")
 
     name_low = target.name.lower()
@@ -6075,15 +6625,6 @@ async def api_serve_generated_media(
         )
 
     # 2. Strict RBAC Allowed-Roots Enforcement
-    cli_brain_root = (config.AGY_CLI_DATA_DIR / "brain").resolve()
-    cli_brain_roots: list[Path] = [cli_brain_root]
-    agy_accs_dir = config.CLI_HOMES_DIR / "_agy_accounts"
-    if agy_accs_dir.is_dir():
-        for acc_b in agy_accs_dir.glob("*/antigravity-cli/brain"):
-            try:
-                cli_brain_roots.append(acc_b.resolve())
-            except OSError:
-                pass
     app_brain_root = (config.AGY_APP_DATA_DIR / "brain").resolve()
     legacy_uploads_root = config.get_effective_legacy_uploads_dir()
     shared_uploads_root = (config.SHARED_PROJECTS_DIR.resolve() / "_uploads").resolve()
@@ -6108,7 +6649,6 @@ async def api_serve_generated_media(
         return None
 
     detected_up_cid = _extract_upload_cid(target)
-    matched_cli_brain = next((br for br in cli_brain_roots if _is_within_dir(target, br)), None)
 
     if matched_cli_brain is not None or _is_within_dir(target, app_brain_root):
         in_cli_brain = matched_cli_brain is not None
@@ -6231,7 +6771,11 @@ async def api_serve_generated_media(
             if not any(_is_within_dir(target, gr) for gr in allowed_guest_roots):
                 raise HTTPException(status_code=403, detail="Доступ к файлу запрещён")
 
-    if not target.exists() or not target.is_file():
+    try:
+        target_stat = target.stat()
+    except (FileNotFoundError, NotADirectoryError):
+        raise HTTPException(status_code=404, detail="Медиафайл не найден на диске") from None
+    if not stat.S_ISREG(target_stat.st_mode):
         raise HTTPException(status_code=404, detail="Медиафайл не найден на диске")
 
     mime = (
@@ -6240,28 +6784,34 @@ async def api_serve_generated_media(
         or "application/octet-stream"
     )
     headers: dict[str, str] = {
-        "Cache-Control": "private, max-age=3600",
+        "Cache-Control": "private, no-cache",
         "X-Content-Type-Options": "nosniff",
     }
 
-    force_attachment = bool(download)
-    if suffix_low in {".html", ".htm", ".xhtml", ".xml"}:
-        # Never execute arbitrary HTML documents inline on Hub's origin
-        force_attachment = True
-    elif suffix_low == ".svg":
+    # Never execute arbitrary HTML documents inline on Hub's origin.
+    force_attachment = bool(download) or suffix_low in {".html", ".htm", ".xhtml", ".xml"} | _FORCE_DOWNLOAD_EXTS
+    if suffix_low == ".svg":
         headers["Content-Security-Policy"] = (
             "default-src 'none'; img-src data:; style-src 'unsafe-inline'; sandbox"
         )
 
-    if force_attachment:
-        return FileResponse(
-            target,
-            media_type=mime,
-            filename=target.name,
-            content_disposition_type="attachment",
-            headers=headers,
+    response = FileResponse(
+        target,
+        stat_result=target_stat,
+        media_type=mime,
+        filename=target.name,
+        content_disposition_type="attachment" if force_attachment else "inline",
+        headers=headers,
+    )
+    if_none_match = request.headers.get("if-none-match", "")
+    if if_none_match.strip() == "*" or response.headers["etag"] in [
+        tag.strip().removeprefix("W/") for tag in if_none_match.split(",")
+    ]:
+        return Response(
+            status_code=304,
+            headers={name: response.headers[name] for name in ("cache-control", "etag", "last-modified")},
         )
-    return FileResponse(target, media_type=mime, headers=headers)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -6277,7 +6827,12 @@ async def _resolve_project_memory_target(
     shared_projs = await database.list_shared_projects(
         for_user_id=current_user["id"], is_admin=is_admin
     )
-    resolved = brain_reader.resolve_user_project(project_name, current_user, shared_projs)
+    resolved = await asyncio.to_thread(
+        brain_reader.resolve_user_project,
+        project_name,
+        current_user,
+        shared_projs,
+    )
     if not resolved:
         raise HTTPException(
             status_code=404,
@@ -6366,7 +6921,11 @@ async def broadcast_project_processes_update(
     send_list_update: bool = True,
 ) -> None:
     clean_proj = (project_name or "").strip()
-    if not clean_proj or not ws_manager.active:
+    if not clean_proj:
+        return
+    if transition_event and transition_event.get("transition") == "crashed":
+        _spawn_telemetry_task(_dispatch_process_crash_webpush(clean_proj, project_dir, transition_event, docker_user_id))
+    if not ws_manager.active:
         return
 
     eff_dir: Optional[Path] = None
@@ -6395,7 +6954,12 @@ async def broadcast_project_processes_update(
             u_shared = await database.list_shared_projects(
                 for_user_id=uid_target, is_admin=(u_conn.get("role") == "admin")
             )
-            resolved_u = brain_reader.resolve_user_project(clean_proj, u_conn, u_shared)
+            resolved_u = await asyncio.to_thread(
+                brain_reader.resolve_user_project,
+                clean_proj,
+                u_conn,
+                u_shared,
+            )
         except Exception:
             resolved_u = None
         if not resolved_u:
@@ -6472,7 +7036,12 @@ async def broadcast_project_processes_update(
             if is_adm
             else [sp for sp in all_shared if uid in (sp.get("member_ids") or [])]
         )
-        resolved_u = brain_reader.resolve_user_project(clean_proj, u_conn, u_shared)
+        resolved_u = await asyncio.to_thread(
+            brain_reader.resolve_user_project,
+            clean_proj,
+            u_conn,
+            u_shared,
+        )
         if not resolved_u:
             continue
         if brain_reader.resolve_effective_project_execution_mode(u_conn, resolved_u) != "host":
@@ -6565,11 +7134,13 @@ async def _broadcast_sandbox_processes_update(
     project_name: str,
     project_dir: Path,
     user_id: str,
+    transition: Optional[dict[str, Any]] = None,
 ) -> None:
     await broadcast_project_processes_update(
         project_name,
         project_dir,
         docker_user_id=user_id,
+        transition_event=transition,
     )
 
 
@@ -6883,7 +7454,12 @@ async def api_get_project_sandbox_status(
     shared_projs = await database.list_shared_projects(
         for_user_id=current_user["id"], is_admin=is_admin
     )
-    resolved = brain_reader.resolve_user_project(project_name, current_user, shared_projs)
+    resolved = await asyncio.to_thread(
+        brain_reader.resolve_user_project,
+        project_name,
+        current_user,
+        shared_projs,
+    )
     if not resolved:
         raise HTTPException(
             status_code=404,
@@ -6916,7 +7492,12 @@ async def api_reset_project_sandbox(
     shared_projs = await database.list_shared_projects(
         for_user_id=current_user["id"], is_admin=is_admin
     )
-    resolved = brain_reader.resolve_user_project(project_name, current_user, shared_projs)
+    resolved = await asyncio.to_thread(
+        brain_reader.resolve_user_project,
+        project_name,
+        current_user,
+        shared_projs,
+    )
     if not resolved:
         raise HTTPException(
             status_code=404,
@@ -7139,6 +7720,7 @@ async def api_update_project_env(
             entries=[e.model_dump() for e in body.entries],
             raw_content=body.raw_content,
             ensure_gitignore=body.ensure_gitignore,
+            expected_sha256=body.expected_sha256,
         )
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc))
@@ -7692,7 +8274,12 @@ async def api_list_all_processes(
     by_project: dict[str, list[dict[str, Any]]] = {}
 
     for p in projects:
-        resolved_p = brain_reader.resolve_user_project(p["name"], current_user, shared_projs)
+        resolved_p = await asyncio.to_thread(
+            brain_reader.resolve_user_project,
+            p["name"],
+            current_user,
+            shared_projs,
+        )
         if not resolved_p:
             continue
         proj_dir = Path(resolved_p["path"]).resolve()
@@ -7770,7 +8357,12 @@ async def api_clear_all_processes(
     total_cleared = 0
 
     for p in projects:
-        resolved_p = brain_reader.resolve_user_project(p["name"], current_user, shared_projs)
+        resolved_p = await asyncio.to_thread(
+            brain_reader.resolve_user_project,
+            p["name"],
+            current_user,
+            shared_projs,
+        )
         if not resolved_p:
             continue
         proj_dir = Path(resolved_p["path"]).resolve()
@@ -8495,6 +9087,7 @@ async def api_rename_project(project_name: str, body: RenameProjectRequest,
                 await asyncio.to_thread(brain_reader.rename_project_directory_on_disk,new_dir,old_name,allowed_parent=old_dir.parent)
                 raise
             await asyncio.to_thread(host_service_manager.HOST_SERVICE_MANAGER.rename_project_in_registry,old_name,old_dir,clean,new_dir)
+            git_service.discard_project_lock(old_dir)
         except ValueError as exc:
             raise HTTPException(400,str(exc))
         except (RuntimeError, OSError) as exc:
@@ -8527,6 +9120,7 @@ async def api_delete_project(project_name: str, body: DeleteProjectRequest = Bod
             raise HTTPException(409,str(exc))
         result = await database.delete_project_records(project_name=name,owner_id=current_user["id"],
             is_shared=resolved["is_shared"],shared_id=resolved.get("shared_id", ""),chats_action=body.chats_action)
+        git_service.discard_project_lock(proj_dir)
         deleted_chats = result.pop("deleted_chats")
         deleted_ids = [c["id"] for c in deleted_chats]
         # Cleanup uses original chat metadata, including protected Desktop source IDs.
@@ -8536,6 +9130,7 @@ async def api_delete_project(project_name: str, body: DeleteProjectRequest = Bod
                 cid = c["id"]
                 CHAT_TURN_QUEUES.pop(cid,None)
                 CHAT_QUEUE_PAUSED.discard(cid)
+                purge_deleted_chat_read_ts(cid)
                 await cleanup_deleted_chat(c,shared=resolved["is_shared"])
         if resolved["is_shared"]:
             await sandbox_service.sync_all_users_sandbox_cli_files()
@@ -8695,8 +9290,11 @@ async def api_export_idea(
     shared_projs = await database.list_shared_projects(
         for_user_id=current_user["id"], is_admin=is_admin
     )
-    resolved = brain_reader.resolve_user_project(
-        body.project_name, current_user, shared_projs
+    resolved = await asyncio.to_thread(
+        brain_reader.resolve_user_project,
+        body.project_name,
+        current_user,
+        shared_projs,
     )
     if not resolved:
         raise HTTPException(status_code=404, detail="Проект не найден или доступ запрещён")
@@ -8965,31 +9563,40 @@ async def _run_turn_task(
 
             next_item: Optional[dict[str, Any]] = None
             next_user: Optional[dict[str, Any]] = None
-            while True:
-                if chat_id in CHAT_QUEUE_PAUSED or chat_id in COMPACTING_CHATS:
-                    break
-                q = CHAT_TURN_QUEUES.get(chat_id)
-                if not q:
-                    CHAT_TURN_QUEUES.pop(chat_id, None)
-                    break
-                # Keep chat marked as generating across the await gap before the next turn starts
-                register_chat_turn(chat_id, user_id=cur_user["id"])
-                cand = q.pop(0)
-                if not q:
-                    CHAT_TURN_QUEUES.pop(chat_id, None)
-                await _broadcast_chat_queue(chat_id)
-                cand_uid = str(cand.get("user_id") or "").strip()
-                u = await database.get_user_by_id(cand_uid) if cand_uid else None
-                if u and u.get("is_active", False):
-                    chk_chat = await database.get_chat(chat_id)
-                    if not chk_chat:
+            queue_mutated = False
+            async with _get_chat_dispatch_lock(chat_id):
+                while True:
+                    if chat_id in CHAT_QUEUE_PAUSED or chat_id in COMPACTING_CHATS:
+                        break
+                    q = CHAT_TURN_QUEUES.get(chat_id)
+                    if not q:
                         CHAT_TURN_QUEUES.pop(chat_id, None)
                         break
-                    allowed_u, _ = await _get_chat_access_context(chk_chat, u)
-                    if allowed_u:
-                        next_item = cand
-                        next_user = u
-                        break
+                    # Keep chat marked as generating across the await gap before the next turn starts
+                    register_chat_turn(chat_id, user_id=cur_user["id"])
+                    cand = q.pop(0)
+                    queue_mutated = True
+                    if not q:
+                        CHAT_TURN_QUEUES.pop(chat_id, None)
+                    cand_uid = str(cand.get("user_id") or "").strip()
+                    u = await database.get_user_by_id(cand_uid) if cand_uid else None
+                    if u and u.get("is_active", False):
+                        chk_chat = await database.get_chat(chat_id)
+                        if not chk_chat:
+                            CHAT_TURN_QUEUES.pop(chat_id, None)
+                            break
+                        allowed_u, _ = await _get_chat_access_context(chk_chat, u)
+                        if allowed_u:
+                            next_item = cand
+                            next_user = u
+                            break
+                if not next_item or not next_user:
+                    if ACTIVE_TURN_TASKS.get(chat_id) is cur_task:
+                        ACTIVE_TURN_TASKS.pop(chat_id, None)
+                        clear_chat_turn(chat_id)
+
+            if queue_mutated:
+                await _broadcast_chat_queue(chat_id)
 
             if not next_item or not next_user:
                 break
@@ -9015,8 +9622,10 @@ async def _run_turn_task(
             cur_pref_accounts = _sanitize_turn_preferred_accounts(next_item)
             cur_user = next_user
     finally:
-        ACTIVE_TURN_TASKS.pop(chat_id, None)
-        clear_chat_turn(chat_id)
+        cur_t = asyncio.current_task()
+        if ACTIVE_TURN_TASKS.get(chat_id) is cur_t:
+            ACTIVE_TURN_TASKS.pop(chat_id, None)
+            clear_chat_turn(chat_id)
 
 
 async def _maybe_generate_live_outline_title_task(
@@ -9135,6 +9744,7 @@ async def _run_turn_task_inner(
             preferred_accounts=preferred_accounts,
         )
     finally:
+        _CHAT_GEN_STARTED_TS_MS.pop(chat_id, None)
         for key in tracked_hq_keys:
             _INFLIGHT_HQ_RETURN_UIDS.discard(key)
 
@@ -9225,8 +9835,11 @@ async def _run_turn_task_inner_body(
         shared_projs = await database.list_shared_projects(
             for_user_id=trigger_user["id"], is_admin=is_admin
         )
-        resolved = brain_reader.resolve_user_project(
-            chat["project_name"], trigger_user, shared_projs
+        resolved = await asyncio.to_thread(
+            brain_reader.resolve_user_project,
+            chat["project_name"],
+            trigger_user,
+            shared_projs,
         )
         if not resolved:
             await ws_manager.broadcast_user(
@@ -9507,6 +10120,8 @@ async def _run_turn_task_inner_body(
             return
         assistant_msg = updated_target
         msg_id = int(assistant_msg["id"])
+        gen_started_ts_ms = int(time.time() * 1000)
+        _CHAT_GEN_STARTED_TS_MS[chat_id] = gen_started_ts_ms
         await _broadcast_chat_event(
             chat_id,
             chat,
@@ -9514,6 +10129,7 @@ async def _run_turn_task_inner_body(
                 "type": "assistant_start",
                 "chat_id": chat_id,
                 "resumed": True,
+                "gen_started_at_ms": gen_started_ts_ms,
                 "message": assistant_msg,
             },
             shared_member_ids=shared_members,
@@ -9659,9 +10275,16 @@ async def _run_turn_task_inner_body(
             status="streaming",
         )
         msg_id = assistant_msg["id"]
+        gen_started_ts_ms = int(time.time() * 1000)
+        _CHAT_GEN_STARTED_TS_MS[chat_id] = gen_started_ts_ms
         await ws_manager.broadcast_for_chat(
             chat,
-            {"type": "assistant_start", "chat_id": chat_id, "message": assistant_msg},
+            {
+                "type": "assistant_start",
+                "chat_id": chat_id,
+                "gen_started_at_ms": gen_started_ts_ms,
+                "message": assistant_msg,
+            },
             shared_member_ids=shared_members,
         )
         all_history = existing_msgs + [user_msg]
@@ -9865,6 +10488,105 @@ async def _run_turn_task_inner_body(
             "last_engine": target_engine,
         }
 
+    turn_gen_started_mono = time.monotonic()
+
+    def _attach_turn_duration(raw_usage: Optional[dict[str, Any]]) -> dict[str, Any]:
+        u = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+        run_ms = max(1, int(round((time.monotonic() - turn_gen_started_mono) * 1000)))
+        existing_dur = u.get("duration_ms")
+        if (
+            not isinstance(existing_dur, (int, float))
+            or isinstance(existing_dur, bool)
+            or existing_dur <= 0
+        ):
+            u["duration_ms"] = run_ms
+        u["last_run_duration_ms"] = max(1, int(round(float(u.get("duration_ms") or run_ms))))
+        return u
+
+    terminal_saved = False
+    stream_content = str(seed_initial_content or "")
+    stream_thinking = str(seed_initial_thinking or "")
+    stream_tools: list[dict[str, Any]] = [dict(tc) for tc in (seed_initial_tools or [])]
+
+    def _completed_tools_sig(tools: list[dict[str, Any]]) -> str:
+        completed = [
+            tc for tc in tools if str(tc.get("status") or "").lower() != "running"
+        ]
+        return json.dumps(completed, ensure_ascii=False, sort_keys=True, default=str)
+
+    def _upsert_stream_tool_step(step_obj: dict[str, Any]) -> None:
+        sid = step_obj.get("id")
+        snum = step_obj.get("step")
+        for idx_tc, existing_tc in enumerate(stream_tools):
+            if sid is not None and existing_tc.get("id") == sid:
+                stream_tools[idx_tc] = step_obj
+                return
+            if sid is None and snum is not None and existing_tc.get("step") == snum:
+                stream_tools[idx_tc] = step_obj
+                return
+        stream_tools.append(step_obj)
+
+    last_checkpoint_mono = time.monotonic()
+    last_checkpoint_sig = (
+        stream_content,
+        stream_thinking,
+        _completed_tools_sig(stream_tools),
+    )
+
+    async def _maybe_checkpoint_stream() -> None:
+        nonlocal last_checkpoint_mono, last_checkpoint_sig
+        now_m = time.monotonic()
+        if (now_m - last_checkpoint_mono) < _STREAM_CHECKPOINT_INTERVAL_SEC:
+            return
+        snap = get_active_run_snapshot(chat_id) or {}
+        snap_content = str(snap.get("content") or "")
+        snap_thinking = str(snap.get("thinking") or "")
+        snap_tools = snap.get("tool_calls") if isinstance(snap.get("tool_calls"), list) else []
+        eff_content = snap_content if len(snap_content) > len(stream_content) else stream_content
+        eff_thinking = snap_thinking if len(snap_thinking) > len(stream_thinking) else stream_thinking
+        eff_tools = list(snap_tools) if len(snap_tools) > len(stream_tools) else list(stream_tools)
+        cur_sig = (eff_content, eff_thinking, _completed_tools_sig(eff_tools))
+        if cur_sig == last_checkpoint_sig:
+            return
+        try:
+            await database.checkpoint_streaming_message(
+                msg_id,
+                content=eff_content,
+                thinking=eff_thinking,
+                tool_calls=eff_tools,
+            )
+            last_checkpoint_sig = cur_sig
+            last_checkpoint_mono = now_m
+        except Exception as cp_exc:
+            logging.getLogger(__name__).debug(
+                "Streaming checkpoint failed for chat %s (msg %s): %s",
+                chat_id,
+                msg_id,
+                cp_exc,
+            )
+
+    last_thinking_sent_mono: float = 0.0
+    pending_thinking_evt: Optional[dict[str, Any]] = None
+
+    async def _flush_pending_thinking() -> None:
+        nonlocal pending_thinking_evt, last_thinking_sent_mono
+        if pending_thinking_evt is None:
+            return
+        ev_to_send = pending_thinking_evt
+        pending_thinking_evt = None
+        last_thinking_sent_mono = time.monotonic()
+        await ws_manager.broadcast_for_chat(
+            chat,
+            {
+                "type": "thinking_update",
+                "chat_id": chat_id,
+                "message_id": msg_id,
+                "thinking": ev_to_send["thinking"],
+                "seq": ev_to_send.get("seq", 0),
+            },
+            shared_member_ids=shared_members,
+        )
+
     try:
         turn_stream = (
             stream_claude_turn(
@@ -9995,7 +10717,7 @@ async def _run_turn_task_inner_body(
                 await ws_manager.broadcast_user(trigger_user["id"], {
                     **evt, "type": "chatgpt_failover", "chat_id": chat_id,
                 })
-                asyncio.create_task(_broadcast_chatgpt_state_to_user(trigger_user["id"]))
+                _spawn_telemetry_task(_broadcast_chatgpt_state_to_user(trigger_user["id"]))
 
             elif etype == "claude_session":
                 await database.update_chat(
@@ -10016,12 +10738,14 @@ async def _run_turn_task_inner_body(
                         "account_id": evt.get("account_id", ""),
                     },
                 )
-                asyncio.create_task(_broadcast_claude_state_to_user(trigger_user["id"]))
+                _spawn_telemetry_task(_broadcast_claude_state_to_user(trigger_user["id"]))
 
             elif etype == "account_session_recovered":
-                asyncio.create_task(_perform_account_sync(auto=True, open_login=False))
+                _spawn_telemetry_task(_perform_account_sync(auto=True, open_login=False))
 
             elif etype == "thinking_status":
+                if not evt.get("active"):
+                    await _flush_pending_thinking()
                 await ws_manager.broadcast_for_chat(
                     chat,
                     {
@@ -10035,33 +10759,50 @@ async def _run_turn_task_inner_body(
                 )
 
             elif etype == "thinking_update":
-                await ws_manager.broadcast_for_chat(
-                    chat,
-                    {
-                        "type": "thinking_update",
-                        "chat_id": chat_id,
-                        "message_id": msg_id,
-                        "thinking": evt["thinking"],
-                        "seq": evt.get("seq", 0),
-                    },
-                    shared_member_ids=shared_members,
-                )
+                stream_thinking = str(evt.get("thinking") or "")
+                now_m = time.monotonic()
+                if (
+                    last_thinking_sent_mono == 0.0
+                    or (now_m - last_thinking_sent_mono) >= _THINKING_UPDATE_MIN_INTERVAL_SEC
+                ):
+                    pending_thinking_evt = None
+                    last_thinking_sent_mono = now_m
+                    await ws_manager.broadcast_for_chat(
+                        chat,
+                        {
+                            "type": "thinking_update",
+                            "chat_id": chat_id,
+                            "message_id": msg_id,
+                            "thinking": evt["thinking"],
+                            "seq": evt.get("seq", 0),
+                        },
+                        shared_member_ids=shared_members,
+                    )
+                else:
+                    pending_thinking_evt = evt
+                await _maybe_checkpoint_stream()
 
             elif etype == "tool_step":
+                await _flush_pending_thinking()
+                compact_step = database.compact_tool_calls_payload([evt["step"]])[0]
+                _upsert_stream_tool_step(compact_step)
                 await ws_manager.broadcast_for_chat(
                     chat,
                     {
                         "type": "tool_step",
                         "chat_id": chat_id,
                         "message_id": msg_id,
-                        "step": database.compact_tool_calls_payload([evt["step"]])[0],
+                        "step": compact_step,
                         "seq": evt.get("seq", 0),
                     },
                     shared_member_ids=shared_members,
                 )
+                await _maybe_checkpoint_stream()
 
             elif etype == "text_delta":
+                await _flush_pending_thinking()
                 delta_str = evt["delta"]
+                stream_content += str(delta_str or "")
                 if live_voice and tts_chunker is not None and tts_queue is not None:
                     for seg in tts_chunker.push(delta_str):
                         tts_queue.put_nowait(seg)
@@ -10076,8 +10817,10 @@ async def _run_turn_task_inner_body(
                     },
                     shared_member_ids=shared_members,
                 )
+                await _maybe_checkpoint_stream()
 
             elif etype == "done":
+                await _flush_pending_thinking()
                 model_advisor_service.record_model_turn_health(model, ok=True)
                 if evt.get('agy_conversation_id') and evt.get('agy_account_id'):
                     await database.update_chat(chat_id, agy_conversation_id=evt['agy_conversation_id'], agy_account_id=evt['agy_account_id'])
@@ -10093,7 +10836,7 @@ async def _run_turn_task_inner_body(
                 prev_db_usage = await _load_current_msg_usage()
                 merged_done_usage = merge_assistant_usage(
                     prev_db_usage,
-                    evt.get("usage") or {},
+                    _attach_turn_duration(evt.get("usage")),
                     clear_last_error=True,
                 )
                 saved = await database.update_message(
@@ -10105,6 +10848,7 @@ async def _run_turn_task_inner_body(
                     model=model,
                     status="done",
                 )
+                terminal_saved = True
                 chat_done_kwargs: dict[str, Any] = {
                     "last_engine": "claude" if use_claude_turn else ("codex" if use_codex_turn else "agy"),
                     "touch_updated_at": True,
@@ -10151,6 +10895,7 @@ async def _run_turn_task_inner_body(
                     turn_done_payload,
                     shared_member_ids=shared_members,
                 )
+                _spawn_telemetry_task(_dispatch_turn_webpush(chat, "turn_done", saved))
                 if live_voice and tts_worker_task is not None:
                     sent_tts_chunks = 0
                     try:
@@ -10236,11 +10981,12 @@ async def _run_turn_task_inner_body(
                     _spawn_telemetry_task(_refresh_and_broadcast_quotas(turn_uid))
 
             elif etype == "cancelled":
+                await _flush_pending_thinking()
                 await _abort_live_tts()
                 prev_db_usage = await _load_current_msg_usage()
                 merged_cancel_usage = merge_assistant_usage(
                     prev_db_usage,
-                    evt.get("usage") or {},
+                    _attach_turn_duration(evt.get("usage")),
                 )
                 saved = await database.update_message(
                     msg_id,
@@ -10250,6 +10996,7 @@ async def _run_turn_task_inner_body(
                     usage=merged_cancel_usage,
                     status="cancelled",
                 )
+                terminal_saved = True
                 record_chat_terminal_ts(chat_id)
                 await ws_manager.broadcast_for_chat(
                     chat,
@@ -10263,11 +11010,12 @@ async def _run_turn_task_inner_body(
                 )
 
             elif etype == "error":
+                await _flush_pending_thinking()
                 await _abort_live_tts()
                 err_txt = evt.get("error", "Неизвестная ошибка")
                 model_advisor_service.record_model_turn_health(model, ok=False, error_text=err_txt)
                 if _is_auth_missing_error(err_txt) and not is_gemini_location_unsupported_error(err_txt):
-                    asyncio.create_task(_perform_account_sync(auto=True, open_login=False))
+                    _spawn_telemetry_task(_perform_account_sync(auto=True, open_login=False))
                 extra_hint = build_turn_error_extra_hint(err_txt, is_admin=is_admin)
                 partial_content = str(evt.get("content") or "").rstrip()
                 err_block = f"⚠️ **Ошибка:** {err_txt}{extra_hint}"
@@ -10279,7 +11027,7 @@ async def _run_turn_task_inner_body(
                 prev_db_usage = await _load_current_msg_usage()
                 merged_err_usage = merge_assistant_usage(
                     prev_db_usage,
-                    evt.get("usage") or {},
+                    _attach_turn_duration(evt.get("usage")),
                     last_error=err_txt,
                 )
                 saved = await database.update_message(
@@ -10290,6 +11038,7 @@ async def _run_turn_task_inner_body(
                     usage=merged_err_usage,
                     status="error",
                 )
+                terminal_saved = True
                 if CHAT_TURN_QUEUES.get(chat_id):
                     CHAT_QUEUE_PAUSED.add(chat_id)
                     await _broadcast_chat_queue(chat_id, chat)
@@ -10305,6 +11054,7 @@ async def _run_turn_task_inner_body(
                     },
                     shared_member_ids=shared_members,
                 )
+                _spawn_telemetry_task(_dispatch_turn_webpush(chat, "turn_error", saved, err_txt))
                 err_uid = str(trigger_user["id"])
                 if use_codex_turn:
                     _spawn_telemetry_task(_broadcast_chatgpt_state_to_user(err_uid))
@@ -10345,45 +11095,60 @@ async def _run_turn_task_inner_body(
         await _abort_live_tts()
         raise
     except Exception as exc:
-        await _abort_live_tts()
-        model_advisor_service.record_model_turn_health(model, ok=False, error_text=str(exc))
-        snap = get_active_run_snapshot(chat_id) or {}
-        partial_content = str(snap.get("content") or "").rstrip()
-        err_block = f"⚠️ **Внутренняя ошибка сервера:** `{exc}`"
-        final_err_content = (
-            f"{partial_content}\n\n---\n{err_block}"
-            if partial_content
-            else err_block
-        )
-        prev_db_usage = await _load_current_msg_usage()
-        merged_exc_usage = merge_assistant_usage(
-            prev_db_usage,
-            None,
-            last_error=str(exc),
-        )
-        saved = await database.update_message(
-            msg_id,
-            content=final_err_content,
-            thinking=snap.get("thinking", ""),
-            tool_calls=normalize_interrupted_tool_calls(snap.get("tool_calls")),
-            usage=merged_exc_usage,
-            status="error",
-        )
-        if CHAT_TURN_QUEUES.get(chat_id):
-            CHAT_QUEUE_PAUSED.add(chat_id)
-            await _broadcast_chat_queue(chat_id, chat)
-        await ws_manager.broadcast_for_chat(
-            chat,
-            {
-                "type": "turn_error",
-                "context_stats": await database.compute_single_chat_context_stats({**chat, "is_generating": False}),
-                "chat_id": chat_id,
-                "message": saved,
-                "error": str(exc),
-            },
-            shared_member_ids=shared_members,
-        )
+        if terminal_saved:
+            logging.getLogger(__name__).warning(
+                "Post-save turn processing error for chat %s (msg %s): %s",
+                chat_id,
+                msg_id,
+                exc,
+            )
+        else:
+            await _abort_live_tts()
+            try:
+                await _flush_pending_thinking()
+            except Exception:
+                pass
+            model_advisor_service.record_model_turn_health(model, ok=False, error_text=str(exc))
+            snap = get_active_run_snapshot(chat_id) or {}
+            partial_content = str(snap.get("content") or stream_content or "").rstrip()
+            err_block = f"⚠️ **Внутренняя ошибка сервера:** `{exc}`"
+            final_err_content = (
+                f"{partial_content}\n\n---\n{err_block}"
+                if partial_content
+                else err_block
+            )
+            prev_db_usage = await _load_current_msg_usage()
+            merged_exc_usage = merge_assistant_usage(
+                prev_db_usage,
+                _attach_turn_duration(None),
+                last_error=str(exc),
+            )
+            saved = await database.update_message(
+                msg_id,
+                content=final_err_content,
+                thinking=snap.get("thinking") or stream_thinking,
+                tool_calls=normalize_interrupted_tool_calls(snap.get("tool_calls") or stream_tools),
+                usage=merged_exc_usage,
+                status="error",
+            )
+            if CHAT_TURN_QUEUES.get(chat_id):
+                CHAT_QUEUE_PAUSED.add(chat_id)
+                await _broadcast_chat_queue(chat_id, chat)
+            record_chat_terminal_ts(chat_id)
+            await ws_manager.broadcast_for_chat(
+                chat,
+                {
+                    "type": "turn_error",
+                    "context_stats": await database.compute_single_chat_context_stats({**chat, "is_generating": False}),
+                    "chat_id": chat_id,
+                    "message": saved,
+                    "error": str(exc),
+                },
+                shared_member_ids=shared_members,
+            )
+            _spawn_telemetry_task(_dispatch_turn_webpush(chat, "turn_error", saved, str(exc)))
     finally:
+        _CHAT_GEN_STARTED_TS_MS.pop(chat_id, None)
         if tts_worker_task is not None and not tts_worker_task.done():
             tts_worker_task.cancel()
 
@@ -10404,6 +11169,9 @@ async def websocket_endpoint(websocket: WebSocket):
             action = data.get("action") or data.get("type")
             if action == "ping":
                 await websocket.send_json({"type": "pong"})
+
+            elif action == "client_focus":
+                ws_manager.update_client_focus(websocket, data)
 
             elif action == "mark_chat_read":
                 raw_ids = data.get("chat_ids")
@@ -10542,23 +11310,8 @@ async def websocket_endpoint(websocket: WebSocket):
                     q.append(item)
                     CHAT_QUEUE_PAUSED.discard(chat_id)
 
-                active_turn_task = ACTIVE_TURN_TASKS.get(chat_id)
-                if (
-                    is_chat_generating(chat_id)
-                    or chat_id in COMPACTING_CHATS
-                    or (active_turn_task is not None and not active_turn_task.done())
-                ):
-                    _enqueue_with_optional_compact()
-                    await _broadcast_chat_queue(chat_id, chat_obj)
-                    await sync_and_broadcast_user_chat_read(
-                        fresh_user["id"], chat_id=chat_id
-                    )
-                    continue
-
-                if compact_first and not live_voice:
-                    msgs_for_cmp = await database.get_messages(
-                        chat_id, include_thinking=False
-                    )
+                send_outcome = "started"
+                async with _get_chat_dispatch_lock(chat_id):
                     active_turn_task = ACTIVE_TURN_TASKS.get(chat_id)
                     if (
                         is_chat_generating(chat_id)
@@ -10566,61 +11319,111 @@ async def websocket_endpoint(websocket: WebSocket):
                         or (active_turn_task is not None and not active_turn_task.done())
                     ):
                         _enqueue_with_optional_compact()
-                        await _broadcast_chat_queue(chat_id, chat_obj)
-                        continue
-
-                    can_cmp = bool(
-                        compute_chat_context_stats(
-                            {**chat_obj, "is_generating": False}, msgs_for_cmp
-                        ).get("can_compact")
-                    )
-                    if can_cmp:
-                        CHAT_TURN_QUEUES.setdefault(chat_id, []).append(item)
+                        send_outcome = "queued"
+                    elif compact_first and not live_voice:
+                        msgs_for_cmp = await database.get_messages(
+                            chat_id, include_thinking=False
+                        )
+                        active_turn_task = ACTIVE_TURN_TASKS.get(chat_id)
+                        if (
+                            is_chat_generating(chat_id)
+                            or chat_id in COMPACTING_CHATS
+                            or (active_turn_task is not None and not active_turn_task.done())
+                        ):
+                            _enqueue_with_optional_compact()
+                            send_outcome = "queued_after_cmp_check"
+                        else:
+                            can_cmp = bool(
+                                compute_chat_context_stats(
+                                    {**chat_obj, "is_generating": False}, msgs_for_cmp
+                                ).get("can_compact")
+                            )
+                            if can_cmp:
+                                CHAT_TURN_QUEUES.setdefault(chat_id, []).append(item)
+                                CHAT_QUEUE_PAUSED.discard(chat_id)
+                                t_cmp = asyncio.create_task(
+                                    _run_turn_task(
+                                        chat_id=chat_id,
+                                        prompt="Сжатие контекста без потери смысла",
+                                        attachments=[],
+                                        override_model=None,
+                                        override_access_mode=None,
+                                        trigger_user=fresh_user,
+                                        initial_kind="compact",
+                                    )
+                                )
+                                ACTIVE_TURN_TASKS[chat_id] = t_cmp
+                                send_outcome = "started_compact"
+                            else:
+                                CHAT_QUEUE_PAUSED.discard(chat_id)
+                                register_chat_turn(
+                                    chat_id,
+                                    user_id=fresh_user["id"],
+                                    project_name=chat_obj.get("project_name", ""),
+                                    chat_title=chat_obj.get("title", ""),
+                                    access_mode=access_mode or chat_obj.get("access_mode", "read_only"),
+                                )
+                                t_turn = asyncio.create_task(
+                                    _run_turn_task(
+                                        chat_id=chat_id,
+                                        prompt=effective_user_prompt,
+                                        attachments=attachments,
+                                        override_model=model,
+                                        override_access_mode=access_mode,
+                                        trigger_user=fresh_user,
+                                        referenced_chat_ids=queued_ref_ids,
+                                        referenced_chats=queued_ref_chats,
+                                        live_voice=live_voice,
+                                        live_session_id=live_session_id,
+                                        tts_voice=tts_voice,
+                                        tts_rate=tts_rate,
+                                        handoff_meta=handoff_meta,
+                                        hq_return_source=hq_return_source,
+                                        hq_return_sources=hq_return_sources,
+                                        preferred_accounts=pref_accounts,
+                                    )
+                                )
+                                ACTIVE_TURN_TASKS[chat_id] = t_turn
+                    else:
                         CHAT_QUEUE_PAUSED.discard(chat_id)
-                        await _broadcast_chat_queue(chat_id, chat_obj)
-                        t_cmp = asyncio.create_task(
+                        register_chat_turn(
+                            chat_id,
+                            user_id=fresh_user["id"],
+                            project_name=chat_obj.get("project_name", ""),
+                            chat_title=chat_obj.get("title", ""),
+                            access_mode=access_mode or chat_obj.get("access_mode", "read_only"),
+                        )
+                        t_turn = asyncio.create_task(
                             _run_turn_task(
                                 chat_id=chat_id,
-                                prompt="Сжатие контекста без потери смысла",
-                                attachments=[],
-                                override_model=None,
-                                override_access_mode=None,
+                                prompt=effective_user_prompt,
+                                attachments=attachments,
+                                override_model=model,
+                                override_access_mode=access_mode,
                                 trigger_user=fresh_user,
-                                initial_kind="compact",
+                                referenced_chat_ids=queued_ref_ids,
+                                referenced_chats=queued_ref_chats,
+                                live_voice=live_voice,
+                                live_session_id=live_session_id,
+                                tts_voice=tts_voice,
+                                tts_rate=tts_rate,
+                                handoff_meta=handoff_meta,
+                                hq_return_source=hq_return_source,
+                                hq_return_sources=hq_return_sources,
+                                preferred_accounts=pref_accounts,
                             )
                         )
-                        ACTIVE_TURN_TASKS[chat_id] = t_cmp
-                        continue
+                        ACTIVE_TURN_TASKS[chat_id] = t_turn
 
-                CHAT_QUEUE_PAUSED.discard(chat_id)
-                register_chat_turn(
-                    chat_id,
-                    user_id=fresh_user["id"],
-                    project_name=chat_obj.get("project_name", ""),
-                    chat_title=chat_obj.get("title", ""),
-                    access_mode=access_mode or chat_obj.get("access_mode", "read_only"),
-                )
-                t_turn = asyncio.create_task(
-                    _run_turn_task(
-                        chat_id=chat_id,
-                        prompt=effective_user_prompt,
-                        attachments=attachments,
-                        override_model=model,
-                        override_access_mode=access_mode,
-                        trigger_user=fresh_user,
-                        referenced_chat_ids=queued_ref_ids,
-                        referenced_chats=queued_ref_chats,
-                        live_voice=live_voice,
-                        live_session_id=live_session_id,
-                        tts_voice=tts_voice,
-                        tts_rate=tts_rate,
-                        handoff_meta=handoff_meta,
-                        hq_return_source=hq_return_source,
-                        hq_return_sources=hq_return_sources,
-                        preferred_accounts=pref_accounts,
+                if send_outcome == "queued":
+                    await _broadcast_chat_queue(chat_id, chat_obj)
+                    await sync_and_broadcast_user_chat_read(
+                        fresh_user["id"], chat_id=chat_id
                     )
-                )
-                ACTIVE_TURN_TASKS[chat_id] = t_turn
+                    continue
+                if send_outcome in ("queued_after_cmp_check", "started_compact"):
+                    await _broadcast_chat_queue(chat_id, chat_obj)
+                    continue
 
             elif action == "run_queued_now":
                 fresh_user = await database.get_user_by_id(ws_user["id"])
@@ -10640,93 +11443,102 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not allowed:
                     continue
 
-                q = CHAT_TURN_QUEUES.get(chat_id) or []
-                target_idx = next(
-                    (i for i, it in enumerate(q) if str(it.get("id")) == queue_id),
-                    -1,
-                )
-                if target_idx < 0:
-                    continue
-                item = q.pop(target_idx)
-                CHAT_QUEUE_PAUSED.discard(chat_id)
+                rq_broadcast_queue = False
+                rq_ws_error = ""
+                rq_cancel_gen = False
+                async with _get_chat_dispatch_lock(chat_id):
+                    q = CHAT_TURN_QUEUES.get(chat_id) or []
+                    target_idx = next(
+                        (i for i, it in enumerate(q) if str(it.get("id")) == queue_id),
+                        -1,
+                    )
+                    if target_idx >= 0:
+                        item = q.pop(target_idx)
+                        CHAT_QUEUE_PAUSED.discard(chat_id)
 
-                cand_uid = str(item.get("user_id") or "").strip()
-                cand_user = await database.get_user_by_id(cand_uid) if cand_uid else None
-                cand_allowed = False
-                if cand_user and cand_user.get("is_active", False):
-                    cand_allowed, _ = await _get_chat_access_context(chat_obj, cand_user)
-                if not cand_user or not cand_allowed:
-                    if not q:
-                        CHAT_TURN_QUEUES.pop(chat_id, None)
+                        cand_uid = str(item.get("user_id") or "").strip()
+                        cand_user = await database.get_user_by_id(cand_uid) if cand_uid else None
+                        cand_allowed = False
+                        if cand_user and cand_user.get("is_active", False):
+                            cand_allowed, _ = await _get_chat_access_context(chat_obj, cand_user)
+                        if not cand_user or not cand_allowed:
+                            if not q:
+                                CHAT_TURN_QUEUES.pop(chat_id, None)
+                            rq_broadcast_queue = True
+                            rq_ws_error = "Автор элемента очереди заблокирован или потерял доступ к диалогу"
+                        else:
+                            busy_generating = is_chat_generating(chat_id)
+                            busy_compacting = chat_id in COMPACTING_CHATS
+                            active_t = ACTIVE_TURN_TASKS.get(chat_id)
+                            busy_task = active_t is not None and not active_t.done()
+
+                            if busy_generating or busy_compacting or busy_task:
+                                q.insert(0, item)
+                                CHAT_TURN_QUEUES[chat_id] = q
+                                rq_broadcast_queue = True
+                                rq_cancel_gen = busy_generating
+                            else:
+                                if not q:
+                                    CHAT_TURN_QUEUES.pop(chat_id, None)
+                                rq_broadcast_queue = True
+                                if item.get("kind") != "compact":
+                                    register_chat_turn(
+                                        chat_id,
+                                        user_id=cand_user["id"],
+                                        project_name=chat_obj.get("project_name", ""),
+                                        chat_title=chat_obj.get("title", ""),
+                                        access_mode=item.get("access_mode")
+                                        or chat_obj.get("access_mode", "read_only"),
+                                    )
+                                task = asyncio.create_task(
+                                    _run_turn_task(
+                                        chat_id=chat_id,
+                                        prompt=str(
+                                            item.get("prompt")
+                                            or "Проанализируй прикреплённые файлы."
+                                        ),
+                                        attachments=list(item.get("attachments") or []),
+                                        override_model=item.get("model"),
+                                        override_access_mode=item.get("access_mode"),
+                                        trigger_user=cand_user,
+                                        initial_kind=str(item.get("kind") or "message"),
+                                        referenced_chat_ids=list(
+                                            item.get("referenced_chat_ids") or []
+                                        ),
+                                        referenced_chats=list(
+                                            item.get("referenced_chats") or []
+                                        ),
+                                        live_voice=bool(item.get("live_voice", False)),
+                                        live_session_id=str(item.get("live_session_id") or ""),
+                                        tts_voice=str(item.get("tts_voice") or ""),
+                                        tts_rate=str(item.get("tts_rate") or ""),
+                                        handoff_meta=_sanitize_handoff_meta(
+                                            item.get("handoff_meta")
+                                        ),
+                                        hq_return_source=_sanitize_hq_return_source(
+                                            item.get("hq_return_source")
+                                        ),
+                                        hq_return_sources=_sanitize_hq_return_sources(item),
+                                        preferred_accounts=_sanitize_turn_preferred_accounts(
+                                            item
+                                        ),
+                                    )
+                                )
+                                ACTIVE_TURN_TASKS[chat_id] = task
+
+                if rq_broadcast_queue:
                     await _broadcast_chat_queue(chat_id, chat_obj)
+                if rq_ws_error:
                     await websocket.send_json(
                         {
                             "type": "ws_error",
                             "chat_id": chat_id,
-                            "error": "Автор элемента очереди заблокирован или потерял доступ к диалогу",
+                            "error": rq_ws_error,
                         }
                     )
                     continue
-
-                busy_generating = is_chat_generating(chat_id)
-                busy_compacting = chat_id in COMPACTING_CHATS
-                active_t = ACTIVE_TURN_TASKS.get(chat_id)
-                busy_task = active_t is not None and not active_t.done()
-
-                if busy_generating or busy_compacting or busy_task:
-                    q.insert(0, item)
-                    CHAT_TURN_QUEUES[chat_id] = q
-                    await _broadcast_chat_queue(chat_id, chat_obj)
-                    if busy_generating:
-                        await cancel_chat_generation(chat_id)
-                else:
-                    if not q:
-                        CHAT_TURN_QUEUES.pop(chat_id, None)
-                    await _broadcast_chat_queue(chat_id, chat_obj)
-                    if item.get("kind") != "compact":
-                        register_chat_turn(
-                            chat_id,
-                            user_id=cand_user["id"],
-                            project_name=chat_obj.get("project_name", ""),
-                            chat_title=chat_obj.get("title", ""),
-                            access_mode=item.get("access_mode")
-                            or chat_obj.get("access_mode", "read_only"),
-                        )
-                    task = asyncio.create_task(
-                        _run_turn_task(
-                            chat_id=chat_id,
-                            prompt=str(
-                                item.get("prompt")
-                                or "Проанализируй прикреплённые файлы."
-                            ),
-                            attachments=list(item.get("attachments") or []),
-                            override_model=item.get("model"),
-                            override_access_mode=item.get("access_mode"),
-                            trigger_user=cand_user,
-                            initial_kind=str(item.get("kind") or "message"),
-                            referenced_chat_ids=list(
-                                item.get("referenced_chat_ids") or []
-                            ),
-                            referenced_chats=list(
-                                item.get("referenced_chats") or []
-                            ),
-                            live_voice=bool(item.get("live_voice", False)),
-                            live_session_id=str(item.get("live_session_id") or ""),
-                            tts_voice=str(item.get("tts_voice") or ""),
-                            tts_rate=str(item.get("tts_rate") or ""),
-                            handoff_meta=_sanitize_handoff_meta(
-                                item.get("handoff_meta")
-                            ),
-                            hq_return_source=_sanitize_hq_return_source(
-                                item.get("hq_return_source")
-                            ),
-                            hq_return_sources=_sanitize_hq_return_sources(item),
-                            preferred_accounts=_sanitize_turn_preferred_accounts(
-                                item
-                            ),
-                        )
-                    )
-                    ACTIVE_TURN_TASKS[chat_id] = task
+                if rq_cancel_gen:
+                    await cancel_chat_generation(chat_id)
 
             elif action == "remove_queued_message":
                 chat_id = (data.get("chat_id") or "").strip()
@@ -10796,49 +11608,6 @@ async def websocket_endpoint(websocket: WebSocket):
                     )
                     continue
 
-                active_t = ACTIVE_TURN_TASKS.get(chat_id)
-                if (
-                    is_chat_generating(chat_id)
-                    or chat_id in COMPACTING_CHATS
-                    or (active_t is not None and not active_t.done())
-                ):
-                    await websocket.send_json(
-                        {
-                            "type": "ws_error",
-                            "chat_id": chat_id,
-                            "error": "Диалог уже выполняется",
-                            "keep_generating": True,
-                        }
-                    )
-                    continue
-
-                eff_access_mode = _cap_access_mode_for_user(
-                    req_access_mode or chat_obj.get("access_mode") or "read_only",
-                    chat_obj["kind"],
-                    fresh_user,
-                )
-                check_model = str(req_model or chat_obj.get("model") or "").strip()
-                if check_model:
-                    quota_err = await _enforce_user_turn_quotas(fresh_user, check_model)
-                    if quota_err:
-                        await websocket.send_json(
-                            {"type": "ws_error", "chat_id": chat_id, "error": quota_err}
-                        )
-                        continue
-
-                msgs = await database.get_messages(chat_id, include_thinking=False)
-                non_sys = [m for m in msgs if m.get("role") != "system"]
-                if not non_sys:
-                    await websocket.send_json(
-                        {
-                            "type": "ws_error",
-                            "chat_id": chat_id,
-                            "error": "Нет прерванного сообщения для продолжения",
-                        }
-                    )
-                    continue
-
-                target_msg = non_sys[-1]
                 req_msg_id_int: Optional[int] = None
                 if raw_msg_id is not None and str(raw_msg_id).strip() != "":
                     try:
@@ -10853,74 +11622,102 @@ async def websocket_endpoint(websocket: WebSocket):
                         )
                         continue
 
-                if (
-                    target_msg.get("role") != "assistant"
-                    or target_msg.get("status") not in ("error", "cancelled")
-                    or (
-                        req_msg_id_int is not None
-                        and int(target_msg["id"]) != req_msg_id_int
-                    )
-                ):
-                    await websocket.send_json(
-                        {
+                eff_access_mode = _cap_access_mode_for_user(
+                    req_access_mode or chat_obj.get("access_mode") or "read_only",
+                    chat_obj["kind"],
+                    fresh_user,
+                )
+                check_model = str(req_model or chat_obj.get("model") or "").strip()
+                continue_err_payload: Optional[dict[str, Any]] = None
+
+                async with _get_chat_dispatch_lock(chat_id):
+                    active_t = ACTIVE_TURN_TASKS.get(chat_id)
+                    if (
+                        is_chat_generating(chat_id)
+                        or chat_id in COMPACTING_CHATS
+                        or (active_t is not None and not active_t.done())
+                    ):
+                        continue_err_payload = {
                             "type": "ws_error",
                             "chat_id": chat_id,
-                            "error": "Продолжить можно только последнее прерванное сообщение ассистента",
+                            "error": "Диалог уже выполняется",
+                            "keep_generating": True,
                         }
-                    )
+                    else:
+                        if check_model:
+                            quota_err = await _enforce_user_turn_quotas(fresh_user, check_model)
+                            if quota_err:
+                                continue_err_payload = {
+                                    "type": "ws_error",
+                                    "chat_id": chat_id,
+                                    "error": quota_err,
+                                }
+                        if continue_err_payload is None:
+                            target_msg, orig_user_msg = await database.get_continue_turn_messages(
+                                chat_id
+                            )
+                            if not target_msg:
+                                continue_err_payload = {
+                                    "type": "ws_error",
+                                    "chat_id": chat_id,
+                                    "error": "Нет прерванного сообщения для продолжения",
+                                }
+                            elif (
+                                target_msg.get("role") != "assistant"
+                                or target_msg.get("status") not in ("error", "cancelled")
+                                or (
+                                    req_msg_id_int is not None
+                                    and int(target_msg["id"]) != req_msg_id_int
+                                )
+                            ):
+                                continue_err_payload = {
+                                    "type": "ws_error",
+                                    "chat_id": chat_id,
+                                    "error": "Продолжить можно только последнее прерванное сообщение ассистента",
+                                }
+                            elif not orig_user_msg:
+                                continue_err_payload = {
+                                    "type": "ws_error",
+                                    "chat_id": chat_id,
+                                    "error": "Не найдено исходное сообщение пользователя для продолжения",
+                                }
+                            else:
+                                orig_refs_raw = (
+                                    orig_user_msg["usage"].get("referenced_chats")
+                                    if isinstance(orig_user_msg.get("usage"), dict)
+                                    else None
+                                )
+                                orig_refs = _sanitize_referenced_chat_specs(
+                                    orig_refs_raw, None, exclude_chat_id=chat_id
+                                )
+                                CHAT_QUEUE_PAUSED.discard(chat_id)
+                                register_chat_turn(
+                                    chat_id,
+                                    user_id=fresh_user["id"],
+                                    project_name=chat_obj.get("project_name", ""),
+                                    chat_title=chat_obj.get("title", ""),
+                                    access_mode=eff_access_mode,
+                                )
+                                t_resume = asyncio.create_task(
+                                    _run_turn_task(
+                                        chat_id=chat_id,
+                                        prompt=str(orig_user_msg.get("content") or ""),
+                                        attachments=list(orig_user_msg.get("attachments") or []),
+                                        override_model=req_model,
+                                        override_access_mode=eff_access_mode,
+                                        trigger_user=fresh_user,
+                                        referenced_chat_ids=[r["id"] for r in orig_refs],
+                                        referenced_chats=orig_refs,
+                                        resume_message_id=int(target_msg["id"]),
+                                        preferred_accounts=req_pref_accounts,
+                                    )
+                                )
+                                ACTIVE_TURN_TASKS[chat_id] = t_resume
+
+                if continue_err_payload is not None:
+                    await websocket.send_json(continue_err_payload)
                     continue
-
-                orig_user_msg = next(
-                    (
-                        m
-                        for m in reversed(non_sys[:-1])
-                        if m.get("role") == "user"
-                    ),
-                    None,
-                )
-                if not orig_user_msg:
-                    await websocket.send_json(
-                        {
-                            "type": "ws_error",
-                            "chat_id": chat_id,
-                            "error": "Не найдено исходное сообщение пользователя для продолжения",
-                        }
-                    )
-                    continue
-
-                orig_refs_raw = (
-                    orig_user_msg["usage"].get("referenced_chats")
-                    if isinstance(orig_user_msg.get("usage"), dict)
-                    else None
-                )
-                orig_refs = _sanitize_referenced_chat_specs(
-                    orig_refs_raw, None, exclude_chat_id=chat_id
-                )
-
-                CHAT_QUEUE_PAUSED.discard(chat_id)
                 await _broadcast_chat_queue(chat_id, chat_obj)
-                register_chat_turn(
-                    chat_id,
-                    user_id=fresh_user["id"],
-                    project_name=chat_obj.get("project_name", ""),
-                    chat_title=chat_obj.get("title", ""),
-                    access_mode=eff_access_mode,
-                )
-                t_resume = asyncio.create_task(
-                    _run_turn_task(
-                        chat_id=chat_id,
-                        prompt=str(orig_user_msg.get("content") or ""),
-                        attachments=list(orig_user_msg.get("attachments") or []),
-                        override_model=req_model,
-                        override_access_mode=eff_access_mode,
-                        trigger_user=fresh_user,
-                        referenced_chat_ids=[r["id"] for r in orig_refs],
-                        referenced_chats=orig_refs,
-                        resume_message_id=int(target_msg["id"]),
-                        preferred_accounts=req_pref_accounts,
-                    )
-                )
-                ACTIVE_TURN_TASKS[chat_id] = t_resume
 
             elif action == "cancel_generation":
                 chat_id = (data.get("chat_id") or "").strip()
@@ -10934,8 +11731,10 @@ async def websocket_endpoint(websocket: WebSocket):
                             await cancel_chat_generation(chat_id)
 
     except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
+        pass
     except Exception:
+        pass
+    finally:
         ws_manager.disconnect(websocket)
 
 
@@ -10970,7 +11769,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
     groq_chunks: list[np.ndarray] = []
     committed_segments: list[str] = []
     commit_epoch = 0
-    commit_in_progress = False
+    pending_commits: int = 0
     finishing = False
     ws_closed = False
 
@@ -11001,7 +11800,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
         return np.concatenate(active_chunks)
 
     async def _commit_utterance(seg_pcm: np.ndarray) -> None:
-        nonlocal commit_epoch, commit_in_progress, used_native_punct, last_model_used
+        nonlocal commit_epoch, pending_commits, used_native_punct, last_model_used
         try:
             async with commit_lock:
                 commit_epoch += 1
@@ -11031,7 +11830,6 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                     if seg_txt:
                         committed_segments.append(seg_txt)
                 commit_epoch += 1
-                commit_in_progress = False
                 if not finishing and not ws_closed:
                     committed_str = voice.join_speech_segments(committed_segments)
                     await safe_send_json(
@@ -11046,8 +11844,9 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                         }
                     )
         except Exception as exc:
-            commit_in_progress = False
             voice.logger.warning("[voice-ws] utterance commit error: %s", exc)
+        finally:
+            pending_commits = max(0, pending_commits - 1)
 
     async def _emit_live_utterance(
         seg_pcm: np.ndarray,
@@ -11055,7 +11854,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
         *,
         forced: bool = False,
     ) -> None:
-        nonlocal commit_epoch, commit_in_progress, used_native_punct, last_model_used
+        nonlocal commit_epoch, pending_commits, used_native_punct, last_model_used
         t_utt = time.perf_counter()
         try:
             async with commit_lock:
@@ -11099,7 +11898,6 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                     final_txt = raw_joined.strip()
 
                 commit_epoch += 1
-                commit_in_progress = False
 
                 alnum_chars = re.findall(r"[A-Za-zА-Яа-яЁё0-9]", final_txt)
                 if not finishing and not ws_closed and len(alnum_chars) >= 2:
@@ -11115,14 +11913,15 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                         }
                     )
         except Exception as exc:
-            commit_in_progress = False
             voice.logger.warning("[voice-ws] live_utterance error: %s", exc)
+        finally:
+            pending_commits = max(0, pending_commits - 1)
 
     async def _preview_loop() -> None:
         nonlocal samples_since_last_preview, last_preview_mono
         while not finishing and not ws_closed:
             await asyncio.sleep(0.10)
-            if finishing or ws_closed or commit_in_progress:
+            if finishing or ws_closed or pending_commits > 0:
                 continue
             now_m = time.monotonic()
             if samples_since_last_preview < int(0.35 * 16000):
@@ -11156,7 +11955,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                 voice.logger.debug("[voice-ws] preview skipped: %s", exc)
                 continue
 
-            if finishing or ws_closed or commit_in_progress or snap_epoch != commit_epoch:
+            if finishing or ws_closed or pending_commits > 0 or snap_epoch != commit_epoch:
                 continue
 
             unstable = str(res.get("text") or "").strip()
@@ -11253,7 +12052,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                     samples_since_last_preview = 0
                     commit_epoch += 1
                     if seg_pcm_now.size > 0 or prior_now:
-                        commit_in_progress = True
+                        pending_commits += 1
                         t_fl = asyncio.create_task(
                             _emit_live_utterance(seg_pcm_now, prior_now, forced=True)
                         )
@@ -11412,7 +12211,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                     trailing_silent_samples = 0
 
             # Contour B: Pause-based Utterance Commit / Continuous Live Call Turn-Taking VAD
-            if not commit_in_progress and not finishing:
+            if pending_commits == 0 and not finishing:
                 active_dur = active_samples / 16000.0
                 if live_call:
                     # Continuous hands-free turn-taking VAD:
@@ -11444,7 +12243,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                         active_peak_rms = 0.0
                         trailing_silent_samples = 0
                         samples_since_last_preview = 0
-                        commit_in_progress = True
+                        pending_commits += 1
                         t_lu = asyncio.create_task(
                             _emit_live_utterance(seg_pcm, prior_segs, forced=False)
                         )
@@ -11483,7 +12282,7 @@ async def voice_websocket_endpoint(websocket: WebSocket):
                         active_peak_rms = 0.0
                         trailing_silent_samples = 0
                         samples_since_last_preview = 0
-                        commit_in_progress = True
+                        pending_commits += 1
                         t_c = asyncio.create_task(_commit_utterance(seg_pcm))
                         bg_tasks.add(t_c)
                         t_c.add_done_callback(bg_tasks.discard)

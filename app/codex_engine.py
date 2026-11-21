@@ -718,8 +718,9 @@ async def _terminate_codex_proc_tree(proc: Optional[asyncio.subprocess.Process])
     if proc.returncode is None:
         pid = proc.pid
         if IS_WINDOWS and pid:
+            tk_ok = False
             try:
-                await asyncio.to_thread(
+                tk_res = await asyncio.to_thread(
                     subprocess.run,
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     stdin=subprocess.DEVNULL,
@@ -728,7 +729,10 @@ async def _terminate_codex_proc_tree(proc: Optional[asyncio.subprocess.Process])
                     timeout=3.0,
                     **subprocess_hidden_kwargs(),
                 )
+                tk_ok = tk_res.returncode == 0
             except Exception:
+                tk_ok = False
+            if not tk_ok and proc.returncode is None:
                 try:
                     proc.kill()
                 except Exception:
@@ -742,9 +746,17 @@ async def _terminate_codex_proc_tree(proc: Optional[asyncio.subprocess.Process])
                 except Exception:
                     pass
         try:
-            await asyncio.wait_for(proc.wait(), timeout=1.5)
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
         except Exception:
-            pass
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+                except Exception:
+                    pass
     for stream_pipe in (proc.stdout, proc.stderr):
         if stream_pipe is not None:
             try:
@@ -1605,117 +1617,151 @@ async def start_chatgpt_device_auth(
 
     out_pump = asyncio.create_task(_pump_stream(proc.stdout))
     err_pump = asyncio.create_task(_pump_stream(proc.stderr))
+    ownership_transferred = False
 
     try:
-        done_wait, _ = await asyncio.wait(
-            [asyncio.create_task(code_ready_evt.wait()), asyncio.create_task(proc.wait())],
-            timeout=15.0,
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if not flow.user_code:
-            # Give pipe pumps a brief moment to flush
-            await asyncio.sleep(0.15)
-            v_url, u_code = parse_device_auth_output("".join(captured_chunks))
-            if v_url:
-                flow.verification_url = v_url
-            if u_code:
-                flow.user_code = u_code
-    except Exception:
-        pass
-
-    if not flow.user_code:
-        await _terminate_codex_proc_tree(proc)
-        await asyncio.to_thread(proxy_router.release_owner, pending_owner)
-        shutil.rmtree(pending_dir, ignore_errors=True)
-        flow.status = "error"
-        raw_err = strip_ansi_codes("".join(captured_chunks)).strip()[:320]
-        flow.error = raw_err or "Не удалось получить код авторизации от `codex login --device-auth`"
-        raise RuntimeError(flow.error)
-
-    async def _await_completion() -> None:
+        code_wait_task = asyncio.create_task(code_ready_evt.wait())
+        proc_wait_task = asyncio.create_task(proc.wait())
+        pending_wait: set[asyncio.Task[Any]] = {code_wait_task, proc_wait_task}
         try:
-            try:
-                rc = await asyncio.wait_for(proc.wait(), timeout=float(flow.expires_in))
-            except asyncio.TimeoutError:
-                if flow.status == "pending":
-                    flow.status = "expired"
-                    flow.error = "Время ожидания кода истекло (10 минут)"
-                await _terminate_codex_proc_tree(proc)
-                return
-
-            await asyncio.gather(out_pump, err_pump, return_exceptions=True)
-            if flow.status == "cancelled":
-                return
-
-            auth_file = pending_dir / "auth.json"
-            if rc != 0 or not auth_file.is_file():
-                flow.status = "error"
-                tail = strip_ansi_codes("".join(captured_chunks)).strip()[-300:]
-                flow.error = tail or f"Процесс входа завершился с кодом {rc}"
-                return
-
-            raw_auth = await asyncio.to_thread(auth_file.read_text, "utf-8")
-            claims = extract_public_claims_from_auth_json(raw_auth)
-            probe: dict[str, Any] = {}
-            try:
-                probe = await probe_codex_home_session(
-                    clean_uid,
-                    pending_dir,
-                    include_models=True,
-                    timeout_sec=12.0,
-                    proxy_url=flow.proxy_url,
-                )
-                # Re-read auth.json in case `account/read` normalized/refreshed it
-                if auth_file.is_file():
-                    raw_auth = await asyncio.to_thread(auth_file.read_text, "utf-8")
-            except Exception:
-                probe = {}
-
-            email = str(probe.get("email") or claims.get("email") or "").strip()
-            plan_type = str(probe.get("plan_type") or claims.get("plan_type") or "").strip().lower()
-            quotas = probe.get("quotas") if isinstance(probe.get("quotas"), dict) else {}
-            if plan_type and isinstance(quotas, dict) and not quotas.get("plan_type"):
-                quotas = {**quotas, "plan_type": plan_type}
-            models = probe.get("models") if isinstance(probe.get("models"), list) else [dict(m) for m in DEFAULT_CODEX_MODELS]
-
-            saved_acc = await database.upsert_user_chatgpt_account(
-                clean_uid,
-                raw_auth_json=raw_auth,
-                chatgpt_account_id=str(claims.get("chatgpt_account_id") or ""),
-                email=email,
-                label=flow.label,
-                plan_type=plan_type,
-                quotas=quotas,
-                models=models,
-                make_active=True,
-                proxy_mode=flow.proxy_mode,
-                proxy_spec=flow.proxy_spec if flow.proxy_mode == "custom" else None,
-                proxy_label=flow.proxy_label,
+            _, pending_wait = await asyncio.wait(
+                [code_wait_task, proc_wait_task],
+                timeout=15.0,
+                return_when=asyncio.FIRST_COMPLETED,
             )
-            await proxy_router.reload_routes_from_db()
-            acc_dir = await asyncio.to_thread(
-                ensure_user_codex_account_dir, clean_uid, str(saved_acc["id"])
-            )
-            await asyncio.to_thread(_write_secret_auth_file, acc_dir, raw_auth)
-
-            flow.account = saved_acc
-            flow.status = "completed"
-            if on_complete is not None:
-                try:
-                    await on_complete(clean_uid, saved_acc)
-                except Exception:
-                    pass
-        except Exception as exc:
-            if flow.status == "pending":
-                flow.status = "error"
-                flow.error = str(exc)[:300]
+            if not flow.user_code:
+                # Give pipe pumps a brief moment to flush
+                await asyncio.sleep(0.15)
+                v_url, u_code = parse_device_auth_output("".join(captured_chunks))
+                if v_url:
+                    flow.verification_url = v_url
+                if u_code:
+                    flow.user_code = u_code
+        except Exception:
+            pass
         finally:
-            await _terminate_codex_proc_tree(proc)
-            await asyncio.to_thread(proxy_router.release_owner, pending_owner)
-            shutil.rmtree(pending_dir, ignore_errors=True)
+            for t in pending_wait:
+                if not t.done():
+                    t.cancel()
+            if pending_wait:
+                await asyncio.gather(*pending_wait, return_exceptions=True)
 
-    flow.wait_task = asyncio.create_task(_await_completion())
-    return flow.to_public_dict()
+        if not flow.user_code:
+            flow.status = "error"
+            raw_err = strip_ansi_codes("".join(captured_chunks)).strip()[:320]
+            flow.error = raw_err or "Не удалось получить код авторизации от `codex login --device-auth`"
+            raise RuntimeError(flow.error)
+
+        async def _await_completion() -> None:
+            try:
+                try:
+                    rc = await asyncio.wait_for(proc.wait(), timeout=float(flow.expires_in))
+                except asyncio.TimeoutError:
+                    if flow.status == "pending":
+                        flow.status = "expired"
+                        flow.error = "Время ожидания кода истекло (10 минут)"
+                    await _terminate_codex_proc_tree(proc)
+                    return
+
+                await asyncio.gather(out_pump, err_pump, return_exceptions=True)
+                if flow.status == "cancelled":
+                    return
+
+                auth_file = pending_dir / "auth.json"
+                if rc != 0 or not auth_file.is_file():
+                    flow.status = "error"
+                    tail = strip_ansi_codes("".join(captured_chunks)).strip()[-300:]
+                    flow.error = tail or f"Процесс входа завершился с кодом {rc}"
+                    return
+
+                raw_auth = await asyncio.to_thread(auth_file.read_text, "utf-8")
+                claims = extract_public_claims_from_auth_json(raw_auth)
+                probe: dict[str, Any] = {}
+                try:
+                    probe = await probe_codex_home_session(
+                        clean_uid,
+                        pending_dir,
+                        include_models=True,
+                        timeout_sec=12.0,
+                        proxy_url=flow.proxy_url,
+                    )
+                    # Re-read auth.json in case `account/read` normalized/refreshed it
+                    if auth_file.is_file():
+                        raw_auth = await asyncio.to_thread(auth_file.read_text, "utf-8")
+                except Exception:
+                    probe = {}
+
+                email = str(probe.get("email") or claims.get("email") or "").strip()
+                plan_type = str(probe.get("plan_type") or claims.get("plan_type") or "").strip().lower()
+                quotas = probe.get("quotas") if isinstance(probe.get("quotas"), dict) else {}
+                if plan_type and isinstance(quotas, dict) and not quotas.get("plan_type"):
+                    quotas = {**quotas, "plan_type": plan_type}
+                models = probe.get("models") if isinstance(probe.get("models"), list) else [dict(m) for m in DEFAULT_CODEX_MODELS]
+
+                saved_acc = await database.upsert_user_chatgpt_account(
+                    clean_uid,
+                    raw_auth_json=raw_auth,
+                    chatgpt_account_id=str(claims.get("chatgpt_account_id") or ""),
+                    email=email,
+                    label=flow.label,
+                    plan_type=plan_type,
+                    quotas=quotas,
+                    models=models,
+                    make_active=True,
+                    proxy_mode=flow.proxy_mode,
+                    proxy_spec=flow.proxy_spec if flow.proxy_mode == "custom" else None,
+                    proxy_label=flow.proxy_label,
+                )
+                await proxy_router.reload_routes_from_db()
+                acc_dir = await asyncio.to_thread(
+                    ensure_user_codex_account_dir, clean_uid, str(saved_acc["id"])
+                )
+                await asyncio.to_thread(_write_secret_auth_file, acc_dir, raw_auth)
+
+                flow.account = saved_acc
+                flow.status = "completed"
+                if on_complete is not None:
+                    try:
+                        await on_complete(clean_uid, saved_acc)
+                    except Exception:
+                        pass
+            except Exception as exc:
+                if flow.status == "pending":
+                    flow.status = "error"
+                    flow.error = str(exc)[:300]
+            finally:
+                for p_t in (out_pump, err_pump):
+                    if not p_t.done():
+                        p_t.cancel()
+                await asyncio.gather(out_pump, err_pump, return_exceptions=True)
+                await _terminate_codex_proc_tree(proc)
+                await asyncio.to_thread(proxy_router.release_owner, pending_owner)
+                shutil.rmtree(pending_dir, ignore_errors=True)
+
+        flow.wait_task = asyncio.create_task(_await_completion())
+        ownership_transferred = True
+        return flow.to_public_dict()
+    finally:
+        if not ownership_transferred:
+            for p_t in (out_pump, err_pump):
+                if not p_t.done():
+                    p_t.cancel()
+            try:
+                await asyncio.gather(out_pump, err_pump, return_exceptions=True)
+            except BaseException:
+                pass
+            try:
+                await _terminate_codex_proc_tree(proc)
+            except BaseException:
+                pass
+            try:
+                await asyncio.to_thread(proxy_router.release_owner, pending_owner)
+            except BaseException:
+                pass
+            shutil.rmtree(pending_dir, ignore_errors=True)
+            if flow.status == "pending":
+                flow.status = "cancelled"
+                _DEVICE_AUTH_FLOWS.pop(flow_id, None)
 
 
 def get_chatgpt_device_auth_flow(user_id: str, flow_id: str) -> Optional[dict[str, Any]]:
@@ -3740,7 +3786,8 @@ async def stream_codex_turn(
             await cancel_chat_sandbox_execs(chat_id)
         except Exception:
             pass
-        ACTIVE_RUNS.pop(chat_id, None)
+        if ACTIVE_RUNS.get(chat_id) is run_state:
+            ACTIVE_RUNS.pop(chat_id, None)
 
 
 async def run_one_shot_codex_prompt(

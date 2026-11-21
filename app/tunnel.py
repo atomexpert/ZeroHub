@@ -6,10 +6,11 @@ import logging
 import os
 import shutil
 import time
+from collections import deque
 from pathlib import Path
 from typing import Any, Optional
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from . import config
 
@@ -119,15 +120,42 @@ def _resolve_ssh_bin() -> str:
     return shutil.which("ssh") or "ssh"
 
 
+_STDERR_TAIL_MAX_BYTES = 8192
+_env_cache_key: Optional[tuple[str, Optional[int], Optional[int]]] = None
+_env_cache_values: dict[str, Optional[str]] = {}
+
+
+def _read_dotenv_cached_sync(env_path: Path) -> dict[str, Optional[str]]:
+    global _env_cache_key, _env_cache_values
+    try:
+        st = env_path.stat()
+        key = (str(env_path), st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = (str(env_path), None, None)
+    if _env_cache_key == key:
+        return _env_cache_values
+    vals = dict(dotenv_values(env_path)) if key[1] is not None else {}
+    _env_cache_key = key
+    _env_cache_values = vals
+    return vals
+
+
 def _load_tunnel_settings() -> dict[str, Any]:
-    load_dotenv(config.ENV_PATH, override=True)
-    enabled_raw = os.getenv("HUB_TUNNEL_ENABLED", "0").strip().lower()
+    file_vals = _read_dotenv_cached_sync(config.ENV_PATH)
+
+    def _get_val(name: str, default: str = "") -> str:
+        v = file_vals.get(name)
+        if v is not None:
+            return str(v)
+        return os.getenv(name, default)
+
+    enabled_raw = _get_val("HUB_TUNNEL_ENABLED", "0").strip().lower()
     enabled = enabled_raw in ("1", "true", "yes", "on")
-    target = os.getenv("HUB_TUNNEL_SSH_TARGET", "").strip()
-    ssh_port = int(os.getenv("HUB_TUNNEL_SSH_PORT", "22").strip() or "22")
-    remote_port = int(os.getenv("HUB_TUNNEL_REMOTE_PORT", "18765").strip() or "18765")
+    target = _get_val("HUB_TUNNEL_SSH_TARGET", "").strip()
+    ssh_port = int(_get_val("HUB_TUNNEL_SSH_PORT", "22").strip() or "22")
+    remote_port = int(_get_val("HUB_TUNNEL_REMOTE_PORT", "18765").strip() or "18765")
     default_key = config.DATA_DIR / "ssh" / "hub_tunnel_ed25519"
-    key_path = Path(os.getenv("HUB_TUNNEL_SSH_KEY", str(default_key)).strip() or str(default_key))
+    key_path = Path(_get_val("HUB_TUNNEL_SSH_KEY", str(default_key)).strip() or str(default_key))
     return {
         "enabled": enabled and bool(target),
         "target": target,
@@ -141,10 +169,59 @@ def get_tunnel_status() -> dict[str, Any]:
     return dict(_status)
 
 
+async def _drain_stderr_tail(
+    stream: Optional[asyncio.StreamReader],
+    tail: deque[bytes],
+    max_bytes: int = _STDERR_TAIL_MAX_BYTES,
+) -> None:
+    if stream is None:
+        return
+    total = 0
+    try:
+        while True:
+            chunk = await stream.read(2048)
+            if not chunk:
+                break
+            if len(chunk) > max_bytes:
+                chunk = chunk[-max_bytes:]
+            tail.append(chunk)
+            total += len(chunk)
+            while total > max_bytes and tail:
+                removed = tail.popleft()
+                total -= len(removed)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass
+
+
+async def _terminate_tunnel_proc(proc: Optional[asyncio.subprocess.Process]) -> None:
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=3.0)
+        return
+    except Exception:
+        pass
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+        except Exception:
+            pass
+
+
 async def _supervise_tunnel_loop() -> None:
     global _tunnel_proc
     while True:
-        cfg = _load_tunnel_settings()
+        cfg = await asyncio.to_thread(_load_tunnel_settings)
         _status["enabled"] = cfg["enabled"]
         _status["target"] = cfg["target"]
         _status["remote_port"] = cfg["remote_port"]
@@ -189,24 +266,30 @@ async def _supervise_tunnel_loop() -> None:
             cfg["target"],
         ]
 
+        stderr_tail: deque[bytes] = deque()
+        drain_task: Optional[asyncio.Task[None]] = None
         try:
             logger.info("Connecting reverse SSH tunnel -> %s (%s)", cfg["target"], forward_spec)
             proc = await asyncio.create_subprocess_exec(
                 *args,
                 stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.PIPE,
                 **config.subprocess_hidden_kwargs(),
             )
             _tunnel_proc = proc
             if proc.pid:
                 _attach_pid_to_job(proc.pid)
+            drain_task = asyncio.create_task(_drain_stderr_tail(proc.stderr, stderr_tail))
 
             # Wait briefly to verify ExitOnForwardFailure didn't abort immediately
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.5)
-                stderr_bytes = await proc.stderr.read() if proc.stderr else b""
-                err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
+                try:
+                    await asyncio.wait_for(drain_task, timeout=1.0)
+                except Exception:
+                    pass
+                err_msg = b"".join(stderr_tail).decode("utf-8", errors="replace").strip()
                 _status["connected"] = False
                 _status["last_error"] = err_msg or f"ssh exited with code {proc.returncode}"
                 logger.warning("Reverse SSH tunnel exited early (%s): %s", proc.returncode, _status["last_error"])
@@ -217,8 +300,11 @@ async def _supervise_tunnel_loop() -> None:
                 _status["last_error"] = ""
                 logger.info("Public HTTPS reverse tunnel active via %s", config.get_public_url() or cfg["target"])
                 await proc.wait()
-                stderr_bytes = await proc.stderr.read() if proc.stderr else b""
-                err_msg = stderr_bytes.decode("utf-8", errors="replace").strip()
+                try:
+                    await asyncio.wait_for(drain_task, timeout=1.0)
+                except Exception:
+                    pass
+                err_msg = b"".join(stderr_tail).decode("utf-8", errors="replace").strip()
                 _status["connected"] = False
                 _status["last_error"] = err_msg or f"disconnected (code {proc.returncode})"
                 logger.warning("Reverse SSH tunnel disconnected (%s); reconnecting soon...", _status["last_error"])
@@ -229,12 +315,15 @@ async def _supervise_tunnel_loop() -> None:
             _status["last_error"] = str(exc)
             logger.warning("Reverse SSH tunnel error: %s", exc)
         finally:
-            if _tunnel_proc and _tunnel_proc.returncode is None:
-                try:
-                    _tunnel_proc.terminate()
-                except Exception:
-                    pass
+            proc_to_stop = _tunnel_proc
             _tunnel_proc = None
+            await _terminate_tunnel_proc(proc_to_stop)
+            if drain_task is not None and not drain_task.done():
+                drain_task.cancel()
+                try:
+                    await drain_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         await asyncio.sleep(4.0)
 
@@ -247,11 +336,9 @@ def start_tunnel_supervisor() -> None:
 
 async def stop_tunnel_supervisor() -> None:
     global _tunnel_task, _tunnel_proc
-    if _tunnel_proc and _tunnel_proc.returncode is None:
-        try:
-            _tunnel_proc.terminate()
-        except Exception:
-            pass
+    proc = _tunnel_proc
+    if proc and proc.returncode is None:
+        await _terminate_tunnel_proc(proc)
     if _tunnel_task and not _tunnel_task.done():
         _tunnel_task.cancel()
         try:
@@ -259,4 +346,5 @@ async def stop_tunnel_supervisor() -> None:
         except asyncio.CancelledError:
             pass
     _tunnel_task = None
+    _tunnel_proc = None
     _status["connected"] = False

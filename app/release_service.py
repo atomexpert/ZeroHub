@@ -165,9 +165,12 @@ def _github(method, path, token="", payload=None, transport=None, allowed=()):
     try:
         response = (transport or _github_json)(request, 12)
     except urllib.error.HTTPError as exc:
-        if exc.code in allowed:
-            return exc.code, {}
-        raise ReleaseError(f"GitHub API returned HTTP {exc.code}.") from None
+        try:
+            if exc.code in allowed:
+                return exc.code, {}
+            raise ReleaseError(f"GitHub API returned HTTP {exc.code}.") from None
+        finally:
+            exc.close()
     except (OSError, ValueError):
         raise ReleaseError("GitHub API is unavailable or returned an invalid response.") from None
     if not isinstance(response, dict):
@@ -537,9 +540,9 @@ def _backup_database(db_path: Path, version: str) -> str | None:
         with tempfile.NamedTemporaryFile(dir=folder, prefix=".hub_backup_", delete=False) as tmp:
             tmp_path = Path(tmp.name)
         try:
-            with contextlib.closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True)) as source:
-                with contextlib.closing(sqlite3.connect(tmp_path)) as destination:
-                    source.backup(destination)
+            with contextlib.closing(sqlite3.connect(db_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=30.0)) as source:
+                with contextlib.closing(sqlite3.connect(tmp_path, timeout=30.0)) as destination:
+                    source.backup(destination, pages=250, sleep=0.02)
             tmp_path.replace(output)
         finally:
             tmp_path.unlink(missing_ok=True)

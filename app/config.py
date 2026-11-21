@@ -11,6 +11,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -1268,6 +1269,38 @@ def apply_isolated_home_to_env(env: dict[str, str], cli_home: Path) -> dict[str,
     env["ORT_DISABLE_ALL_GPU"] = "1"
     return env
 
+def atomic_write_bytes(dest: Path, data: bytes) -> None:
+    """Atomically write raw bytes to `dest` via temporary sibling file + fsync + os.replace."""
+    dest_path = Path(dest)
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=dest_path.parent,
+            prefix=f".{dest_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = Path(fh.name)
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, dest_path)
+    except BaseException:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+
+
+def atomic_write_text(dest: Path, content: str, encoding: str = "utf-8") -> None:
+    """Atomically write text to `dest` via `atomic_write_bytes`."""
+    atomic_write_bytes(dest, content.encode(encoding))
+
+
 SECRET_KEY_FILE = DATA_DIR / ".secret_key"
 _env_secret = os.getenv("HUB_SECRET_KEY", "").strip()
 if _env_secret:
@@ -1276,7 +1309,8 @@ elif SECRET_KEY_FILE.exists():
     HUB_SECRET_KEY = SECRET_KEY_FILE.read_text(encoding="utf-8").strip()
 else:
     HUB_SECRET_KEY = secrets.token_hex(32)
-    SECRET_KEY_FILE.write_text(HUB_SECRET_KEY, encoding="utf-8")
+    SECRET_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(SECRET_KEY_FILE, HUB_SECRET_KEY, encoding="utf-8")
 
 
 def get_or_create_hub_secret() -> str:
@@ -1296,7 +1330,7 @@ def get_or_create_hub_secret() -> str:
     generated = secrets.token_hex(32)
     try:
         SECRET_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-        SECRET_KEY_FILE.write_text(generated, encoding="utf-8")
+        atomic_write_text(SECRET_KEY_FILE, generated, encoding="utf-8")
     except OSError:
         pass
     return generated
